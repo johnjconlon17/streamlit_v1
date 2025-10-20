@@ -464,7 +464,7 @@ if role == "Student":
                     # Sentence UI: "I'd give [Name] [#] [items] for [#] of their [items]"
                     st.markdown("**I’d give**")
                     give_num = st.number_input("Quantity you give", 1, 2, 1, key="give_num")
-                    give_type = st.selectbox("of your", (active_types or []), index=0 if active_types else None, key="give_type")
+                    give_type = st.selectbox("of my", (active_types or []), index=0 if active_types else None, key="give_type")
 
                     st.markdown("**for**")
                     get_num = st.number_input("Quantity you want", 1, 2, 1, key="get_num")
