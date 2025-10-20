@@ -1,4 +1,4 @@
-# app.py  (no password gate)
+# app.py  (no password gate)  — with Efficiency Dashboard
 import streamlit as st
 import sqlite3
 import random
@@ -6,6 +6,7 @@ import pandas as pd
 import numpy as np
 from itertools import permutations
 from contextlib import closing
+from collections import defaultdict
 import time
 
 # ─────────────────────────────────────────────
@@ -134,7 +135,6 @@ def active_goods_in_group(grp):
     return sorted({r[0] for r in rows})
 
 def pick_start_good_unique(grp):
-    """Choose a starting good unique within the group if possible; otherwise allow repeats."""
     used = set(active_goods_in_group(grp))
     available = [g for g in GOODS if g not in used]
     if available:
@@ -147,10 +147,8 @@ def get_or_create_user(name, grp):
         return row[0]
     execute("INSERT INTO users (name, grp) VALUES (?,?)", (name, grp))
     uid = fetchone("SELECT id FROM users WHERE name=? AND grp=?", (name, grp))[0]
-    # unique endowment if possible
     start_good = pick_start_good_unique(grp)
     execute("INSERT INTO endowments VALUES (?,?)", (uid, start_good))
-    # full preference vector (we'll display only active goods later)
     for g in GOODS:
         u = random.randint(1, 10)
         execute("INSERT INTO preferences VALUES (?,?,?)", (uid, g, u))
@@ -165,7 +163,12 @@ def get_user_prefs_df(uid):
     return pd.DataFrame(r, columns=["Good", "Utility"])
 
 def current_allocation_for_group(grp):
-    r = fetchall("SELECT u.id, u.name, e.good FROM users u JOIN endowments e ON e.user_id=u.id WHERE u.grp=?", (grp,))
+    r = fetchall("""
+        SELECT u.id, u.name, e.good
+        FROM users u JOIN endowments e ON e.user_id=u.id
+        WHERE u.grp=?
+        ORDER BY u.name
+    """, (grp,))
     return pd.DataFrame(r, columns=["user_id", "Name", "Good"])
 
 def preferences_matrix(grp, users_df, items):
@@ -274,6 +277,241 @@ def optimal_assignment(grp):
             total += int(util[i, j])
         assign = [(df.iloc[i]["Name"], items[chosen[i]], int(util[i, chosen[i]])) for i in range(n)]
         return total, df, assign
+
+# ─────────────────────────────────────────────
+# Pareto tools for Planner Dashboard
+# ─────────────────────────────────────────────
+def _planner_state(grp):
+    """Return (users_df, items, util, name_index, good_index, current_indices)"""
+    users_df = current_allocation_for_group(grp)  # user_id, Name, Good
+    items = list(users_df["Good"])                # current goods by holder index
+    util = preferences_matrix(grp, users_df, items)
+    name_index = {i: users_df.iloc[i]["Name"] for i in range(len(users_df))}
+    good_index = {j: items[j] for j in range(len(items))}
+    # current assignment is identity: user i holds item i
+    current_indices = list(range(len(users_df)))
+    return users_df, items, util, name_index, good_index, current_indices
+
+def is_pareto_efficient_current(grp):
+    """Check if current allocation is Pareto efficient (w.r.t. individual rationality relative to current)."""
+    users_df, items, util, *_ = _planner_state(grp)
+    n = len(users_df)
+    if n <= 1:
+        return True
+    # edge i->j if util[i,j] >= util[i,i]; strict if >
+    better_or_equal = (util >= np.diag(util))
+    strict = (util > np.diag(util))
+    # Build mapping by pointing each i to an acceptable j with highest utility (tie-break own item)
+    # Then see if any cycle contains at least one strict edge.
+    targets = []
+    for i in range(n):
+        acceptable_idxs = np.where(better_or_equal[i])[0]
+        # prefer keeping item if tied
+        best_val = -1
+        best_j = i
+        for j in acceptable_idxs:
+            v = util[i, j]
+            if v > best_val or (v == best_val and j == i):
+                best_val = v; best_j = j
+        targets.append(best_j)
+    # Detect cycles and whether any has at least one strict improvement
+    visited = [0]*n
+    for i in range(n):
+        if visited[i]: continue
+        path_index = {}
+        cur = i
+        while True:
+            if visited[cur]: break
+            path_index[cur] = len(path_index)
+            visited[cur] = 1
+            cur = targets[cur]
+            if cur in path_index:
+                # found cycle: nodes with index >= path_index[cur]
+                cycle_nodes = [k for k, idx in path_index.items() if idx >= path_index[cur]]
+                # strict if any i in cycle has util[i, targets[i]] > util[i,i]
+                if any(strict[k, targets[k]] for k in cycle_nodes if targets[k] != k):
+                    return False
+                break
+    return True
+
+def closest_efficient_pareto_improvement(grp):
+    """
+    Greedy TTC-style: in each round, form 'best acceptable' pointers and
+    execute the single cycle with the FEWEST strictly-better participants.
+    Repeat until no strictly-improving cycles remain.
+    Return: (total_utility, strictly_better_count, final_assignment list of (Name, Good))
+    All comparisons are vs the ORIGINAL current allocation.
+    """
+    users_df, items, util, name_index, good_index, _ = _planner_state(grp)
+    n = len(users_df)
+    if n == 0:
+        return 0, 0, []
+    base_util_self = np.diag(util).copy()
+
+    # Working copies
+    cur_items = items[:]  # items[j] is the label of item at index j
+    # Track which item index each user i currently points to when choosing best acceptable
+    def build_targets():
+        better_or_equal = (util >= np.diag(util))
+        targets = []
+        for i in range(n):
+            acceptable = np.where(better_or_equal[i])[0]
+            # choose highest utility acceptable (tie-break: own item to reduce churn)
+            best_v = -1
+            best_j = i
+            for j in acceptable:
+                v = util[i, j]
+                if v > best_v or (v == best_v and j == i):
+                    best_v = v; best_j = j
+            targets.append(best_j)
+        return targets
+
+    # To interpret strictness vs ORIGINAL current allocation:
+    def strictly_better_in_edge(i, j):
+        return util[i, j] > base_util_self[i]
+
+    strictly_better_seen = set()
+    iteration_guard = 0
+    while True:
+        iteration_guard += 1
+        if iteration_guard > n * 5:
+            break  # safety
+
+        targets = build_targets()
+
+        # Find all cycles in the functional graph i -> targets[i]
+        visited = [0]*n
+        cycles = []
+        for s in range(n):
+            if visited[s]: continue
+            path_index = {}
+            cur = s
+            while not visited[cur]:
+                path_index[cur] = len(path_index)
+                visited[cur] = 1
+                cur = targets[cur]
+                if cur in path_index:
+                    # cycle nodes:
+                    idx0 = path_index[cur]
+                    ordered = sorted(path_index.items(), key=lambda kv: kv[1])
+                    cyc = [node for node, idx in ordered if idx >= idx0]
+                    cycles.append(cyc)
+                    break
+
+        # Filter to strictly-improving cycles (at least one strict edge vs ORIGINAL base)
+        improving_cycles = []
+        for cyc in cycles:
+            has_strict = False
+            for i in cyc:
+                j = targets[i]
+                if i != j and strictly_better_in_edge(i, j):
+                    has_strict = True; break
+            if has_strict:
+                improving_cycles.append(cyc)
+
+        if not improving_cycles:
+            # no more improvement cycles → Pareto-efficient
+            break
+
+        # Pick the cycle with the FEWEST strictly-better participants (greedy "closest" step)
+        def cycle_strict_count(cyc):
+            return sum(1 for i in cyc if targets[i] != i and strictly_better_in_edge(i, targets[i]))
+        improving_cycles.sort(key=lambda cyc: (cycle_strict_count(cyc), len(cyc)))
+        chosen = improving_cycles[0]
+
+        # Execute the chosen cycle: move items along the pointers on this cycle
+        # For cycle i1->i2->...->ik->i1, each node gets the item of its target.
+        new_items = cur_items[:]
+        for idx in range(len(chosen)):
+            i = chosen[idx]
+            j = targets[i]
+            # assign i the item currently at index j
+            new_items[i] = cur_items[j]
+        cur_items = new_items
+
+        # Update util "self" diagonal to reflect who strictly improved vs ORIGINAL
+        for i in chosen:
+            j = targets[i]
+            if strictly_better_in_edge(i, j):
+                strictly_better_seen.add(i)
+
+        # Recompute util columns order to reflect new item positions
+        # Note: util[i, j] indexes by item index j; when items permute, util w.r.t. the current j stays valid.
+        # We don't need to reorder util; j is always an item index (position), not a label.
+
+        # Continue loop until no improving cycles remain
+
+    # Compute final totals for this allocation
+    # Build (Name, Good) for final assignment
+    final_assignment = [(users_df.iloc[i]["Name"], cur_items[i]) for i in range(n)]
+    # Total utility in final allocation:
+    # Need index of each item label in the ORIGINAL items list to find column index
+    label_to_index = {label: idx for idx, label in enumerate(items)}
+    total_final = 0
+    for i in range(n):
+        j = label_to_index[cur_items[i]]
+        total_final += int(util[i, j])
+
+    return int(total_final), int(len(strictly_better_seen)), final_assignment
+
+def utility_maximizing_pareto_improvement(grp):
+    """
+    Maximize total utility subject to individual rationality vs current:
+    util[i, j] >= util[i, i] for all i who receive j.
+    Solve via Hungarian on a restricted matrix (disallow IR-violating edges by setting -inf).
+    Return: (total_utility, strictly_better_count, assignment list of (Name, Good))
+    """
+    users_df, items, util, name_index, good_index, _ = _planner_state(grp)
+    n = len(users_df)
+    if n == 0:
+        return 0, 0, []
+
+    base_self = np.diag(util)
+    allowed = util >= np.diag(util)  # IR constraints
+    # Build restricted matrix: very negative cost for disallowed edges
+    # We'll maximize util -> minimize negative util
+    REJECT = -10**9
+    restricted_util = util.copy().astype(float)
+    restricted_util[~allowed] = -1e6  # big negative so they won't be chosen
+    try:
+        from scipy.optimize import linear_sum_assignment
+        r, c = linear_sum_assignment(-restricted_util)  # maximize
+        total = int(restricted_util[r, c].sum())
+        # If any disallowed chosen (would be -1e6), then no IR-feasible improving assignment → fall back
+        if total <= int(base_self.sum()):
+            # No strictly improving IR-feasible solution, return current
+            assign = [(users_df.iloc[i]["Name"], items[i]) for i in range(n)]
+            strictly = 0
+            return int(base_self.sum()), strictly, assign
+        assign = []
+        strictly = 0
+        for i in range(n):
+            good_label = items[c[i]]
+            assign.append((users_df.iloc[i]["Name"], good_label))
+            if util[i, c[i]] > base_self[i]:
+                strictly += 1
+        return int(sum(util[i, c[i]] for i in range(n))), int(strictly), assign
+    except Exception:
+        # Fallback greedy under IR
+        remaining = set(range(n))
+        chosen = {}
+        total = 0
+        strictly = 0
+        for i in range(n):
+            # among allowed items pick best remaining
+            choices = [j for j in range(n) if j in remaining and util[i, j] >= base_self[i]]
+            if not choices:
+                # must keep own if available
+                if i in remaining:
+                    j = i
+                else:
+                    j = next(iter(remaining))
+            else:
+                j = max(choices, key=lambda jj: util[i, jj])
+            chosen[i] = j; remaining.discard(j)
+            total += int(util[i, j]); strictly += int(util[i, j] > base_self[i])
+        assign = [(users_df.iloc[i]["Name"], items[chosen[i]]) for i in range(n)]
+        return int(total), int(strictly), assign
 
 # ─────────────────────────────────────────────
 # UI
@@ -399,11 +637,11 @@ elif role == "Social Planner":
             with st.expander("Current Allocation", expanded=True):
                 st.dataframe(df[["Name", "Good"]], width="stretch", hide_index=True)
 
-            cur = total_current_utility(grp)
-            maxu, _, assign = optimal_assignment(grp)
+            cur_total = total_current_utility(grp)
+            max_total, _, assign = optimal_assignment(grp)
             c1, c2 = st.columns(2)
-            c1.metric("Current Total Utility", cur)
-            c2.metric("Max Possible Utility", maxu)
+            c1.metric("Current Total Utility", cur_total)
+            c2.metric("Max Possible Total Utility", max_total)
 
             rows = fetchall(
                 """SELECT u.name, e.good, p.utility
@@ -417,21 +655,55 @@ elif role == "Social Planner":
             st.dataframe(pd.DataFrame(rows, columns=["Name", "Good", "Utility"]),
                          width="stretch", hide_index=True)
 
-            st.subheader("One Optimal Assignment")
-            if assign:
-                st.dataframe(pd.DataFrame(assign, columns=["Name", "Assigned Good", "Utility"]),
-                             width="stretch", hide_index=True)
-            else:
-                st.caption("Not enough data yet.")
+            # ── Efficiency Dashboard ─────────────────────────────────────────
+            st.divider()
+            st.subheader("Efficiency Dashboard")
 
+            # Pareto efficient now?
+            pareto_now = is_pareto_efficient_current(grp)
+            st.markdown("**Pareto Efficient (current allocation)?** " + ("Yes" if pareto_now else "No"))
+
+            # Closest Pareto-efficient Pareto-improving allocation (greedy TTC)
+            closest_total, closest_strict, closest_assign = closest_efficient_pareto_improvement(grp)
+            # Utility-maximizing Pareto-improving allocation (restricted Hungarian)
+            utilpi_total, utilpi_strict, utilpi_assign = utility_maximizing_pareto_improvement(grp)
+
+            # Summaries
+            c3, c4 = st.columns(2)
+            with c3:
+                st.caption("Closest Efficient Pareto-Improving Allocation (greedy TTC)")
+                st.metric("People strictly better off vs current", closest_strict)
+                st.metric("Total utility in that allocation", closest_total, delta=closest_total - cur_total)
+                with st.expander("Show assignment"):
+                    if closest_assign:
+                        st.dataframe(pd.DataFrame(closest_assign, columns=["Name", "Assigned Good"]),
+                                     width="stretch", hide_index=True)
+                    else:
+                        st.caption("No improvement available (already Pareto efficient).")
+
+            with c4:
+                st.caption("Utility-Maximizing Pareto-Improving Allocation (IR-constrained Hungarian)")
+                st.metric("People strictly better off vs current", utilpi_strict)
+                st.metric("Total utility in that allocation", utilpi_total, delta=utilpi_total - cur_total)
+                with st.expander("Show assignment"):
+                    if utilpi_assign:
+                        st.dataframe(pd.DataFrame(utilpi_assign, columns=["Name", "Assigned Good"]),
+                                     width="stretch", hide_index=True)
+                    else:
+                        st.caption("No improvement available (already Pareto efficient).")
+
+            st.caption("Notes: The 'closest efficient' result uses a greedy trading-cycles heuristic; "
+                       "the IR-constrained Hungarian maximizes total utility subject to no one being worse off.")
+
+            # ── Admin Controls ───────────────────────────────────────────────
             st.divider(); st.subheader("Admin Controls")
             with st.expander("Danger Zone — Reset Data", expanded=False):
-                c1, c2 = st.columns(2)
-                with c1:
+                cA, cB = st.columns(2)
+                with cA:
                     allc = st.checkbox("Confirm reset ALL", key="rall")
                     if st.button("⚠️ Reset ALL Data", disabled=not allc):
                         reset_all_data(); st.success("All data cleared."); st.rerun()
-                with c2:
+                with cB:
                     one = st.checkbox("Confirm reset group", key="rgrp")
                     if st.button("♻️ Reset This Group", disabled=not one):
                         reset_group(grp); st.success("Group cleared."); st.rerun()
