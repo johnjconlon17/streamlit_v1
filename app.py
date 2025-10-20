@@ -1,7 +1,8 @@
 # app.py
-# Streamlit Allocation Planner with Admin/Participant Views (URL-param only)
-# Requires: streamlit>=1.37, pandas>=2.0, numpy>=1.25, pulp, (optional) scipy
-# On Streamlit Cloud, include in requirements.txt:
+# Streamlit Allocation Planner with URL-based Admin/Participant views
+# + Participant metadata (name, group, section) inputs & URL-prefill
+#
+# requirements.txt (Streamlit Cloud):
 # streamlit>=1.37
 # pandas>=2.0
 # numpy>=1.25
@@ -18,19 +19,18 @@ st.set_page_config(page_title="Allocation Planner", layout="wide")
 
 
 # ------------------------------------------------------------
-# URL Param Role Detection (no UI toggles)
+# URL helpers (role + optional participant metadata prefill)
 # ------------------------------------------------------------
-def get_role_from_query() -> str:
-    """
-    Determine role from ?admin= URL param.
-    Returns "planner" if admin in ("1","true","yes"), else "participant".
-    """
+def get_query_param(key: str, default: str = "") -> str:
     try:
-        admin_val = st.query_params.get("admin", "0")
+        val = st.query_params.get(key, default)
     except Exception:
-        admin_val = (st.experimental_get_query_params().get("admin", ["0"])[0])
+        val = st.experimental_get_query_params().get(key, [default])[0]
+    return str(val)
 
-    admin_val = str(admin_val).lower()
+
+def get_role_from_query() -> str:
+    admin_val = get_query_param("admin", "0").lower()
     is_admin = admin_val in ("1", "true", "yes")
     return "planner" if is_admin else "participant"
 
@@ -41,7 +41,7 @@ st.markdown("**View:** {}"
 
 
 # ------------------------------------------------------------
-# Helpers & State
+# App state helpers
 # ------------------------------------------------------------
 def ensure_state():
     """Initialize example data if none exists."""
@@ -84,6 +84,23 @@ def ensure_state():
         )
 
 
+def reindex_all_frames():
+    """Keep frames aligned after edits to people/goods."""
+    people = st.session_state.people
+    goods = st.session_state.goods
+
+    st.session_state.utilities_df = st.session_state.utilities_df.reindex(
+        index=people, columns=goods, fill_value=0.0
+    )
+    st.session_state.stock_df = st.session_state.stock_df.reindex(index=goods).fillna(0.0)
+    st.session_state.allocation_df = st.session_state.allocation_df.reindex(
+        index=people, columns=goods, fill_value=0.0
+    )
+
+
+# ------------------------------------------------------------
+# Core math helpers
+# ------------------------------------------------------------
 def clamp_allocation_to_stock(allocation: pd.DataFrame, stock: pd.Series) -> pd.DataFrame:
     """Rescale down proportionally if current allocation exceeds stock by any good."""
     A = allocation.copy().astype(float)
@@ -112,15 +129,10 @@ def solve_pareto_improvement(
     epsilon: float = 1e-6,
 ) -> Tuple[bool, pd.DataFrame, Optional[pd.DataFrame], Dict]:
     """
-    Test if a Pareto-improving allocation exists (continuous).
-    If exists, return improved allocation.
-
+    Check if a Pareto-improving allocation exists (continuous).
     Maximize sum_i,g u[i,g]*x[i,g]
-    s.t.    sum_i x[i,g] <= stock[g]
-            sum_g u[i,g]*x[i,g] >= current utility_i   (IR constraints)
-
-    Returns:
-      (is_efficient, improved_alloc, deltas, debug_info)
+    s.t. sum_i x[i,g] <= stock[g]
+         sum_g u[i,g]*x[i,g] >= current utility_i   (IR constraints)
     """
     people = list(utilities_df.index)
     goods = list(utilities_df.columns)
@@ -204,22 +216,8 @@ def summarize_swaps(transfer_df: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def reindex_all_frames():
-    """Keep frames aligned after edits to people/goods."""
-    people = st.session_state.people
-    goods = st.session_state.goods
-
-    st.session_state.utilities_df = st.session_state.utilities_df.reindex(
-        index=people, columns=goods, fill_value=0.0
-    )
-    st.session_state.stock_df = st.session_state.stock_df.reindex(index=goods).fillna(0.0)
-    st.session_state.allocation_df = st.session_state.allocation_df.reindex(
-        index=people, columns=goods, fill_value=0.0
-    )
-
-
 # ------------------------------------------------------------
-# App Body
+# App setup
 # ------------------------------------------------------------
 ensure_state()
 reindex_all_frames()
@@ -232,7 +230,7 @@ current_alloc = st.session_state.allocation_df.copy().astype(float)
 
 
 # ============================================================
-# PLANNER (ADMIN) VIEW  — visible only if ?admin=1/true/yes
+# PLANNER (ADMIN) VIEW — only if ?admin=1/true/yes
 # ============================================================
 if role == "planner":
     st.title("Planner: Efficiency Dashboard & Controls")
@@ -252,7 +250,7 @@ if role == "planner":
                 reindex_all_frames()
                 st.rerun()
 
-    # Refresh after possible edits
+    # Refresh after edits
     people = st.session_state.people
     goods = st.session_state.goods
     utilities_df = st.session_state.utilities_df.copy().astype(float)
@@ -320,7 +318,7 @@ if role == "planner":
             st.json(debug)
 
     st.divider()
-    st.caption("Note: The test uses a continuous LP relaxation. If you need indivisible/integer items or a shortest-move improvement, we can switch to an MILP or add alternative objectives.")
+    st.caption("Note: LP uses continuous quantities. For indivisible items or shortest-move improvements, we can switch to MILP or alternative objectives.")
 
 
 # ============================================================
@@ -329,13 +327,27 @@ if role == "planner":
 else:
     st.title("Participant: Trade Proposals")
 
+    # --- Participant metadata (with URL prefill support) ---
+    prefill_name = get_query_param("name", "")
+    prefill_group = get_query_param("group", "")
+    prefill_section = get_query_param("section", "")
+
+    meta_cols = st.columns(3)
+    with meta_cols[0]:
+        p_name = st.text_input("Your name", value=prefill_name, placeholder="e.g., Jane Doe", key="p_name")
+    with meta_cols[1]:
+        p_group = st.text_input("Group / Team", value=prefill_group, placeholder="e.g., Blue", key="p_group")
+    with meta_cols[2]:
+        p_section = st.text_input("Section (optional)", value=prefill_section, placeholder="e.g., A", key="p_section")
+
+    st.caption("Build a natural-language trade proposal. This does **not** execute trades.")
+
+    # Use current session data (read-only for participants, but visible)
     people = st.session_state.people
     goods = st.session_state.goods
     utilities_df = st.session_state.utilities_df.copy().astype(float)
     stock = st.session_state.stock_df["Total Available"].copy().astype(float)
     current_alloc = st.session_state.allocation_df.copy().astype(float)
-
-    st.caption("Build a natural-language trade proposal. This does **not** execute trades.")
 
     colp = st.columns(2)
     with colp[0]:
@@ -361,13 +373,25 @@ else:
         st.dataframe(current_alloc.loc[[recipient]].T.rename(columns={recipient: "Qty"}))
 
     if give_qty > 0 and get_qty > 0:
-        proposal = f"I'd give {recipient} {give_qty:g} {give_good} in exchange for {get_qty:g} {get_good}."
+        base_sentence = f"I'd give {recipient} {give_qty:g} {give_good} in exchange for {get_qty:g} {get_good}."
     else:
-        proposal = "Please choose positive quantities to form a proposal."
+        base_sentence = "Please choose positive quantities to form a proposal."
 
     st.subheader("Your Proposal")
-    st.write(proposal)
+    # Include the participant’s metadata in a tidy summary block:
+    meta_lines = []
+    if p_name.strip():
+        meta_lines.append("Name: " + p_name.strip())
+    if p_group.strip():
+        meta_lines.append("Group: " + p_group.strip())
+    if p_section.strip():
+        meta_lines.append("Section: " + p_section.strip())
+    if meta_lines:
+        st.write(", ".join(meta_lines))
 
+    st.write(base_sentence)
+
+    # Simple coherence checks
     problems = []
     if give_qty > current_alloc.loc[giver, give_good] + 1e-12:
         problems.append(f"{giver} only has {current_alloc.loc[giver, give_good]:g} of {give_good} to give.")
@@ -381,5 +405,13 @@ else:
     else:
         st.info("Looks coherent given current holdings (this does not execute the trade).")
 
+    # Copy-friendly text block
+    st.markdown("**Copy this text to submit:**")
+    copy_lines = []
+    if meta_lines:
+        copy_lines.append("; ".join(meta_lines))
+    copy_lines.append(base_sentence)
+    st.code("\n".join(copy_lines), language="text")
+
     st.divider()
-    st.caption("Tip: Instructors use the planner view by appending “?admin=1” to the app URL.")
+    st.caption("Tip: Instructors use the planner view by appending “?admin=1”. You can prefill fields like “?name=Jane%20Doe&group=Blue&section=A”.")
