@@ -21,6 +21,24 @@ AUTOREFRESH_MS = 5000  # refresh UI every 5s so trades appear promptly
 
 st.set_page_config(page_title="Bilateral Trading Game", page_icon="🔁", layout="wide")
 
+import time
+
+# ---- global defaults (so it works before sidebar renders) ----
+if "auto_refresh" not in st.session_state:
+    st.session_state["auto_refresh"] = True   # default ON for everyone
+if "refresh_interval" not in st.session_state:
+    st.session_state["refresh_interval"] = 5  # seconds, change as you like
+
+# ---- clock-driven rerun that survives st.stop() ----
+if st.session_state["auto_refresh"]:
+    if "next_refresh_time" not in st.session_state:
+        st.session_state["next_refresh_time"] = time.time() + st.session_state["refresh_interval"]
+    # If it's time, schedule the next tick and rerun immediately
+    if time.time() >= st.session_state["next_refresh_time"]:
+        st.session_state["next_refresh_time"] = time.time() + st.session_state["refresh_interval"]
+        st.rerun()  # use st.rerun() on Streamlit 1.50+
+
+
 # --------- DB helpers ---------
 @st.cache_resource
 def get_conn():
@@ -299,13 +317,6 @@ def optimal_assignment(grp):
 # --------- UI ---------
 init_db()
 
-with st.sidebar:
-    st.header("Bilateral Trading Game")
-    # keep your existing role/group/name inputs here...
-    # add these two controls anywhere in the sidebar:
-    auto_refresh = st.toggle("Auto-refresh", value=True, help="Rerun the app on a timer so trades appear for everyone.")
-    refresh_seconds = st.number_input("Refresh every (seconds)", min_value=2, max_value=60, value=5, step=1)
-
 st.session_state["auto_refresh"] = auto_refresh
 st.session_state["refresh_interval"] = refresh_seconds
 
@@ -313,6 +324,8 @@ with st.sidebar:
     st.header("Bilateral Trading Game")
     role = st.radio("Select role", role_options, index=0)
     grp = st.text_input("Group code", placeholder="e.g., A1 or econ101-1").strip()
+    auto_refresh = st.toggle("Auto-refresh", value=True, help="Rerun the app on a timer so trades appear for everyone.")
+    refresh_seconds = st.number_input("Refresh every (seconds)", min_value=2, max_value=60, value=5, step=1)
     if role == "Student":
         name = st.text_input("Your name", placeholder="First Last").strip()
         start_btn = st.button("Enter / Join Group")
