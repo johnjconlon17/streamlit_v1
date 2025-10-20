@@ -201,68 +201,104 @@ init_db()
 
 with st.sidebar:
     st.header("Bilateral Trading Game")
-    role=st.radio("Select role",role_options,index=0)
-    grp=st.text_input("Group code",placeholder="e.g., A1 or econ101-1").strip()
+    role = st.radio("Select role", role_options, index=0)
 
-    default_interval=3 if role=="Social Planner" else 8
-    auto=st.toggle("Auto-refresh",value=st.session_state["auto_refresh"])
-    secs=st.number_input("Refresh every (s)",2,60,st.session_state["refresh_interval"])
-    if auto!=st.session_state["auto_refresh"] or secs!=st.session_state["refresh_interval"]:
-        st.session_state["auto_refresh"]=auto
-        st.session_state["refresh_interval"]=int(secs)
-        st.session_state["next_refresh_time"]=time.time()+st.session_state["refresh_interval"]
-    if role=="Student":
-        name=st.text_input("Your name").strip()
-        start_btn=st.button("Enter / Join Group")
+    # Prefill from prior login if available
+    prev_name, prev_grp = (st.session_state.get("who") or ("", ""))
+
+    grp = st.text_input("Group code", value=prev_grp, placeholder="e.g., A1 or econ101-1", key="grp_input")
+
+    if role == "Student":
+        name = st.text_input("Your name", value=prev_name, placeholder="First Last", key="name_input")
+        start_btn = st.button("Enter / Join Group")
+
+    # --- Auto-refresh controls ---
+    default_interval = 3 if role == "Social Planner" else 8
+    auto = st.toggle("Auto-refresh", value=st.session_state["auto_refresh"])
+    secs = st.number_input("Refresh every (s)", 2, 60, st.session_state["refresh_interval"], step=1)
+    if auto != st.session_state["auto_refresh"] or secs != st.session_state["refresh_interval"]:
+        st.session_state["auto_refresh"] = auto
+        st.session_state["refresh_interval"] = int(secs)
+        st.session_state["next_refresh_time"] = time.time() + st.session_state["refresh_interval"]
 
 colA,colB=st.columns(2)
-
 # ── Student Role ─────────────────────────────
-if role=="Student":
-    if not grp or not name:
-        st.info("Enter group and name in the sidebar.")
-        st.stop()
-    if start_btn or "user_id" not in st.session_state or st.session_state.get("who")!=(name,grp):
-        uid=get_or_create_user(name,grp)
-        st.session_state["user_id"]=uid; st.session_state["who"]=(name,grp)
-        st.rerun()
-    uid=st.session_state["user_id"]
+if role == "Student":
+    # Use cleaned values for logic (don’t strip the widget values themselves)
+    grp_clean = (grp or "").strip()
+    name_clean = (name or "").strip() if "name" in locals() else ""
+
+    if "user_id" not in st.session_state:
+        # First-time join: require inputs
+        if not grp_clean or not name_clean:
+            st.info("Enter group and name in the sidebar to begin.")
+            st.stop()
+        if start_btn or True:
+            uid = get_or_create_user(name_clean, grp_clean)
+            st.session_state["user_id"] = uid
+            st.session_state["who"] = (name_clean, grp_clean)
+            st.rerun()
+
+    # Already logged in: use saved identity for all queries
+    uid = st.session_state["user_id"]
+    name_clean, grp_clean = st.session_state["who"]
 
     with colA:
         st.subheader("Your Endowment")
-        good=get_user_endowment(uid)
-        st.metric("You currently hold",good)
+        good = get_user_endowment(uid)
+        st.metric("You currently hold", good)
+
         st.subheader("Your Preferences")
-        st.dataframe(get_user_prefs_df(uid),use_container_width=True,hide_index=True)
+        st.dataframe(get_user_prefs_df(uid), use_container_width=True, hide_index=True)
+
         st.subheader("Propose a Trade")
-        others=[(u[1],u[0]) for u in get_group_users(grp) if u[0]!=uid]
-        if not others: st.warning("No one else yet.")
+        others = [(u[1], u[0]) for u in get_group_users(grp_clean) if u[0] != uid]
+        if not others:
+            st.warning("No one else yet.")
         else:
-            target=st.selectbox("Partner",[x[0] for x in others])
-            tid=dict(others)[target]
-            their=get_user_endowment(tid)
-            st.write("Your item:",good)
-            st.write(target+"'s item:",their)
-            if st.button("Send offer"): st.success(propose_trade(grp,uid,tid)); st.rerun()
+            partner_names = [x[0] for x in others]
+            target = st.selectbox("Partner", partner_names)
+            tid = dict(others)[target]
+            their = get_user_endowment(tid)
+            st.write("Your item:", good)
+            st.write(target + "'s item:", their)
+            if st.button("Send offer"):
+                st.success(propose_trade(grp_clean, uid, tid))
+                st.rerun()
+
         st.subheader("Outgoing Offers")
         for t in outgoing_trades(uid):
-            id_,to,pg,rg,status,_=t
+            id_, to, pg, rg, status, _ = t
             with st.container(border=True):
                 st.write(f"To {to}: {pg} ↔ {rg} ({status})")
-                if st.button("Cancel",key="c"+str(id_)): cancel_outgoing(id_,uid); st.rerun()
+                if st.button("Cancel", key="c" + str(id_)):
+                    cancel_outgoing(id_, uid)
+                    st.rerun()
+
     with colB:
         st.subheader("Incoming Offers")
-        inc=incoming_trades(uid)
+        inc = incoming_trades(uid)
         for t in inc:
-            id_,frm,pg,rg,_,_=t
+            id_, frm, pg, rg, _, _ = t
             with st.container(border=True):
                 st.write(f"From {frm}: they give {pg}, you give {rg}")
-                a,b=st.columns(2)
-                if a.button("Accept",key="a"+str(id_)): st.success(accept_trade(id_)); st.rerun()
-                if b.button("Decline",key="d"+str(id_)): decline_trade(id_); st.rerun()
+                a, b = st.columns(2)
+                if a.button("Accept", key="a" + str(id_)):
+                    st.success(accept_trade(id_))
+                    st.rerun()
+                if b.button("Decline", key="d" + str(id_)):
+                    decline_trade(id_)
+                    st.rerun()
+
         st.subheader("Group Members")
-        st.dataframe(current_allocation_for_group(grp)[["Name","Good"]],use_container_width=True,hide_index=True)
-        if st.button("Refresh now"): st.rerun()
+        st.dataframe(
+            current_allocation_for_group(grp_clean)[["Name", "Good"]],
+            use_container_width=True,
+            hide_index=True
+        )
+
+        if st.button("Refresh now"):
+            st.rerun()
 
 # ── Social Planner Role ──────────────────────
 elif role=="Social Planner":
