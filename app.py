@@ -323,9 +323,22 @@ st.session_state["refresh_interval"] = refresh_seconds
 with st.sidebar:
     st.header("Bilateral Trading Game")
     role = st.radio("Select role", role_options, index=0)
+
     grp = st.text_input("Group code", placeholder="e.g., A1 or econ101-1").strip()
-    auto_refresh = st.toggle("Auto-refresh", value=True, help="Rerun the app on a timer so trades appear for everyone.")
-    refresh_seconds = st.number_input("Refresh every (seconds)", min_value=2, max_value=60, value=5, step=1)
+
+    # Defaults based on role (optional)
+    default_interval = 3 if role == "Social Planner" else 8
+
+    # Controls (these will influence the top-of-file timer on the next render)
+    auto_refresh = st.toggle("Auto-refresh", value=st.session_state.get("auto_refresh", True))
+    refresh_seconds = st.number_input("Refresh every (seconds)", min_value=2, max_value=60,
+                                      value=st.session_state.get("refresh_interval", default_interval), step=1)
+    # Persist and reset the clock if changed
+    if auto_refresh != st.session_state["auto_refresh"] or refresh_seconds != st.session_state["refresh_interval"]:
+        st.session_state["auto_refresh"] = auto_refresh
+        st.session_state["refresh_interval"] = int(refresh_seconds)
+        st.session_state["next_refresh_time"] = time.time() + st.session_state["refresh_interval"]
+
     if role == "Student":
         name = st.text_input("Your name", placeholder="First Last").strip()
         start_btn = st.button("Enter / Join Group")
