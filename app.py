@@ -1,95 +1,111 @@
-# app.py  — IR efficiency vs ORIGINAL and vs CURRENT baselines
+# app.py — Multi-unit market with 1-for-1 / 2-for-1 / 1-for-2 / 2-for-2 trades
 import streamlit as st
 import sqlite3
 import random
 import pandas as pd
 import numpy as np
-from itertools import permutations
 from contextlib import closing
+import json
 import time
 
 # ─────────────────────────────────────────────
 # Page config FIRST
 # ─────────────────────────────────────────────
-st.set_page_config(page_title="Bilateral Trading Game", page_icon="🔁", layout="wide")
+st.set_page_config(page_title="Bilateral Trading Game (Multi-Unit)", page_icon="🔁", layout="wide")
 
 # ─────────────────────────────────────────────
-# Admin gate (URL param only)
+# Role gate via URL param (no passwords)
 # ─────────────────────────────────────────────
 params = st.query_params
 is_admin_mode = "admin" in params and str(params["admin"]).lower() in ["1", "true", "yes"]
 role_options = ["Student"] + (["Social Planner"] if is_admin_mode else [])
 
 # ─────────────────────────────────────────────
-# Config + auto-refresh defaults
+# Master goods list (we'll sample T per group at start)
 # ─────────────────────────────────────────────
-GOODS = [
+MASTER_GOODS = [
     "Gizmo", "Whatsit", "Thingamabob", "Doohickey", "Widget",
     "Contraption", "Gadget", "Whatchamacallit", "Doodad", "Thingy",
-    "Gubbins", "Apparatus", "Mechanism", "Rigamarole", "Oddment"
+    "Gubbins", "Apparatus", "Mechanism", "Rigamarole", "Oddment",
+    "Thingummy", "Whirligig", "Dinglehopper", "Curio", "Bric-a-brac"
 ]
-DB_PATH = "class_trade.db"
 
+DB_PATH = "class_trade_multi.db"
+
+# ─────────────────────────────────────────────
+# Light auto-refresh defaults
+# ─────────────────────────────────────────────
 if "auto_refresh" not in st.session_state:
     st.session_state["auto_refresh"] = True
 if "refresh_interval" not in st.session_state:
-    st.session_state["refresh_interval"] = 5
+    st.session_state["refresh_interval"] = 6
 
 # ─────────────────────────────────────────────
-# DB helpers
+# DB helpers / schema
 # ─────────────────────────────────────────────
 @st.cache_resource
 def get_conn():
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=5.0)
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=6.0)
     conn.execute("PRAGMA journal_mode=WAL;")
-    conn.execute("PRAGMA busy_timeout=3000;")
+    conn.execute("PRAGMA busy_timeout=4000;")
     return conn
 
 def init_db():
     conn = get_conn()
     with closing(conn.cursor()) as cur:
+        # Users
         cur.execute("""
             CREATE TABLE IF NOT EXISTS users (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 name TEXT NOT NULL,
-                grp TEXT NOT NULL,
+                grp  TEXT NOT NULL,
                 UNIQUE(name, grp)
             )
         """)
+        # Group config / lifecycle
         cur.execute("""
-            CREATE TABLE IF NOT EXISTS endowments (
-                user_id INTEGER PRIMARY KEY,
-                good TEXT NOT NULL,
-                FOREIGN KEY(user_id) REFERENCES users(id)
+            CREATE TABLE IF NOT EXISTS groups (
+                grp TEXT PRIMARY KEY,
+                status TEXT NOT NULL DEFAULT 'waiting',  -- 'waiting' | 'started'
+                k INTEGER DEFAULT 1,                     -- units per student
+                t INTEGER DEFAULT 5,                     -- # distinct types in this group
+                types_json TEXT DEFAULT '[]',            -- JSON array of active types
+                started_ts DATETIME
             )
         """)
-        # NEW: remember each user's original good
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS initial_endowments (
-                user_id INTEGER PRIMARY KEY,
-                good TEXT NOT NULL,
-                FOREIGN KEY(user_id) REFERENCES users(id)
-            )
-        """)
+        # Preferences: utility per type (1..10)
         cur.execute("""
             CREATE TABLE IF NOT EXISTS preferences (
                 user_id INTEGER NOT NULL,
-                good TEXT NOT NULL,
+                type TEXT NOT NULL,
                 utility INTEGER NOT NULL,
-                PRIMARY KEY (user_id, good),
-                FOREIGN KEY(user_id) REFERENCES users(id)
+                PRIMARY KEY (user_id, type),
+                FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
             )
         """)
+        # Items: each row is one copy
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS items (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                grp TEXT NOT NULL,
+                type TEXT NOT NULL,
+                owner_id INTEGER NOT NULL,
+                FOREIGN KEY(owner_id) REFERENCES users(id) ON DELETE CASCADE
+            )
+        """)
+        # Multi-unit trade proposals (bundle on each side)
         cur.execute("""
             CREATE TABLE IF NOT EXISTS trades (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 grp TEXT NOT NULL,
                 proposer_id INTEGER NOT NULL,
                 recipient_id INTEGER NOT NULL,
-                proposer_good TEXT NOT NULL,
-                recipient_good TEXT NOT NULL,
-                status TEXT NOT NULL,     -- 'pending', 'accepted', 'declined', 'cancelled'
-                ts DATETIME DEFAULT CURRENT_TIMESTAMP
+                offer_json TEXT NOT NULL,    -- {"type": count, ...} from proposer to recipient
+                request_json TEXT NOT NULL,  -- {"type": count, ...} from recipient to proposer
+                status TEXT NOT NULL,        -- 'pending' | 'accepted' | 'declined' | 'cancelled'
+                ts DATETIME DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(proposer_id) REFERENCES users(id),
+                FOREIGN KEY(recipient_id) REFERENCES users(id)
             )
         """)
         conn.commit()
@@ -106,348 +122,213 @@ def fetchall(q, p=()):
 
 def execute(q, p=()):
     c = get_conn(); cur = c.cursor()
-    cur.execute(q, p); c.commit()
-    cur.close()
+    cur.execute(q, p); c.commit(); cur.close()
 
-# resets
-def reset_all_data():
-    execute("DELETE FROM trades")
-    execute("DELETE FROM preferences")
-    execute("DELETE FROM endowments")
-    execute("DELETE FROM initial_endowments")
-    execute("DELETE FROM users")
-    execute("VACUUM")
+# ─────────────────────────────────────────────
+# Group lifecycle helpers
+# ─────────────────────────────────────────────
+def ensure_group_row(grp):
+    if not grp:
+        return
+    row = fetchone("SELECT grp FROM groups WHERE grp=?", (grp,))
+    if not row:
+        execute("INSERT INTO groups (grp, status, k, t, types_json) VALUES (?, 'waiting', 1, 5, '[]')", (grp,))
+
+def get_group_state(grp):
+    row = fetchone("SELECT status, k, t, types_json FROM groups WHERE grp=?", (grp,))
+    if not row:
+        return ("waiting", 1, 5, [])
+    status, k, t, tj = row
+    types = json.loads(tj or "[]")
+    return (status, int(k), int(t), types)
+
+def set_group_config(grp, status=None, k=None, t=None, types=None):
+    ensure_group_row(grp)
+    cur_status, cur_k, cur_t, cur_types = get_group_state(grp)
+    status = status if status is not None else cur_status
+    k = k if k is not None else cur_k
+    t = t if t is not None else cur_t
+    types_json = json.dumps(types if types is not None else cur_types)
+    execute("UPDATE groups SET status=?, k=?, t=?, types_json=? WHERE grp=?",
+            (status, int(k), int(t), types_json, grp))
 
 def reset_group(grp):
-    uids = [u[0] for u in get_group_users(grp)]
     execute("DELETE FROM trades WHERE grp=?", (grp,))
-    for uid in uids:
-        execute("DELETE FROM preferences WHERE user_id=?", (uid,))
-        execute("DELETE FROM endowments WHERE user_id=?", (uid,))
-        execute("DELETE FROM initial_endowments WHERE user_id=?", (uid,))
-        execute("DELETE FROM users WHERE id=?", (uid,))
-    execute("VACUUM")
+    execute("DELETE FROM items  WHERE grp=?", (grp,))
+    # Keep users; they can re-join same names. Preferences remain; can be re-used.
+    set_group_config(grp, status="waiting", types=[], k=1, t=5)
 
-# ─────────────────────────────────────────────
-# Core model logic
-# ─────────────────────────────────────────────
 def get_group_users(grp):
-    return fetchall("SELECT id, name FROM users WHERE grp=? ORDER BY name", (grp,))
+    return fetchall("SELECT id, name FROM users WHERE grp=? ORDER BY name COLLATE NOCASE", (grp,))
 
-def active_goods_in_group(grp):
-    rows = fetchall("""
-        SELECT e.good
-        FROM endowments e
-        JOIN users u ON u.id = e.user_id
-        WHERE u.grp=?
-    """, (grp,))
-    return sorted({r[0] for r in rows})
-
-def pick_start_good_unique(grp):
-    used = set(active_goods_in_group(grp))
-    available = [g for g in GOODS if g not in used]
-    return random.choice(available if available else GOODS)
-
+# ─────────────────────────────────────────────
+# Users / preferences
+# ─────────────────────────────────────────────
 def get_or_create_user(name, grp):
+    ensure_group_row(grp)
+    status, _, _, _ = get_group_state(grp)
     row = fetchone("SELECT id FROM users WHERE name=? AND grp=?", (name, grp))
     if row:
         return row[0]
+    # If market already started, block new joins
+    if status == "started":
+        raise RuntimeError("Market already started for this group; new students cannot join until reset.")
     execute("INSERT INTO users (name, grp) VALUES (?,?)", (name, grp))
     uid = fetchone("SELECT id FROM users WHERE name=? AND grp=?", (name, grp))[0]
-    start_good = pick_start_good_unique(grp)
-    execute("INSERT INTO endowments VALUES (?,?)", (uid, start_good))
-    execute("INSERT OR REPLACE INTO initial_endowments VALUES (?,?)", (uid, start_good))
-    for g in GOODS:
+    # Create full preference vector across all master types (we'll display only active ones)
+    for t in MASTER_GOODS:
         u = random.randint(1, 10)
-        execute("INSERT INTO preferences VALUES (?,?,?)", (uid, g, u))
+        execute("INSERT OR REPLACE INTO preferences (user_id, type, utility) VALUES (?,?,?)", (uid, t, u))
     return uid
 
-def get_user_endowment(uid):
-    r = fetchone("SELECT good FROM endowments WHERE user_id=?", (uid,))
-    return r[0] if r else None
+def prefs_df_for_user(uid, active_types):
+    rows = fetchall("SELECT type, utility FROM preferences WHERE user_id=?",(uid,))
+    df = pd.DataFrame(rows, columns=["Type", "Utility"])
+    if active_types:
+        df = df[df["Type"].isin(active_types)]
+    return df.sort_values("Type")
 
-def get_initial_endowment(uid):
-    r = fetchone("SELECT good FROM initial_endowments WHERE user_id=?", (uid,))
-    if r:
-        return r[0]
-    # Backfill if table was added after users existed
-    cur = get_user_endowment(uid)
-    if cur:
-        execute("INSERT OR REPLACE INTO initial_endowments VALUES (?,?)", (uid, cur))
-        return cur
-    return None
+# ─────────────────────────────────────────────
+# Items / inventories
+# ─────────────────────────────────────────────
+def allocate_initial_items(grp, k, types):
+    # Remove any existing items first
+    execute("DELETE FROM items WHERE grp=?", (grp,))
+    users = get_group_users(grp)
+    if not users:
+        return
+    for uid, _ in users:
+        for _ in range(k):
+            typ = random.choice(types)
+            execute("INSERT INTO items (grp, type, owner_id) VALUES (?,?,?)", (grp, typ, uid))
 
-def get_user_prefs_df(uid):
-    r = fetchall("SELECT good, utility FROM preferences WHERE user_id=? ORDER BY good", (uid,))
-    return pd.DataFrame(r, columns=["Good", "Utility"])
+def inventory_counts(grp, uid):
+    rows = fetchall("SELECT type, COUNT(*) FROM items WHERE grp=? AND owner_id=? GROUP BY type", (grp, uid))
+    return {t: c for (t, c) in rows}
 
-def current_allocation_for_group(grp):
-    r = fetchall("""
-        SELECT u.id, u.name, e.good
-        FROM users u JOIN endowments e ON e.user_id=u.id
-        WHERE u.grp=?
-        ORDER BY u.name
-    """, (grp,))
-    return pd.DataFrame(r, columns=["user_id", "Name", "Good"])
+def inventory_items_by_type(grp, uid):
+    rows = fetchall("SELECT id, type FROM items WHERE grp=? AND owner_id=?", (grp, uid))
+    by = {}
+    for iid, t in rows:
+        by.setdefault(t, []).append(iid)
+    return by  # {type: [item_ids...]}
 
-def original_allocation_for_group(grp):
-    r = fetchall("""
-        SELECT u.id, u.name, ie.good
-        FROM users u JOIN initial_endowments ie ON ie.user_id=u.id
-        WHERE u.grp=?
-        ORDER BY u.name
-    """, (grp,))
-    # If some users were missing (older games), backfill from current
-    if not r:
-        cur = current_allocation_for_group(grp)
-        for uid, nm, gd in cur.itertuples(index=False):
-            execute("INSERT OR REPLACE INTO initial_endowments VALUES (?,?)", (int(uid), str(gd)))
-        r = [(int(uid), str(nm), str(gd)) for uid, nm, gd in cur.itertuples(index=False)]
-    return pd.DataFrame(r, columns=["user_id", "Name", "Good"])
+def group_active_types(grp):
+    _, _, _, types = get_group_state(grp)
+    return types
 
-def preferences_matrix(grp, users_df, items):
-    mats = []
-    for uid in users_df["user_id"]:
-        prefs = dict(fetchall("SELECT good, utility FROM preferences WHERE user_id=?", (uid,)))
-        mats.append([prefs[g] for g in items])
-    return np.array(mats, int)
+# ─────────────────────────────────────────────
+# Utility with zero marginal after first copy
+# ─────────────────────────────────────────────
+def bundle_utility(uid, types_set):
+    # types_set: set of type strings the user owns at least 1 of
+    rows = fetchall("SELECT type, utility FROM preferences WHERE user_id=?", (uid,))
+    u_map = {t: v for (t, v) in rows}
+    return sum(u_map.get(t, 0) for t in types_set)
 
-def propose_trade(grp, pid, rid):
-    if pid == rid:
+def user_types_set(grp, uid):
+    rows = fetchall("SELECT DISTINCT type FROM items WHERE grp=? AND owner_id=?", (grp, uid))
+    return {t for (t,) in rows}
+
+def current_total_utility(grp):
+    users = get_group_users(grp)
+    s = 0
+    for uid, _ in users:
+        s += bundle_utility(uid, user_types_set(grp, uid))
+    return s
+
+# ─────────────────────────────────────────────
+# Trade helpers (bundles up to 2 types per side)
+# ─────────────────────────────────────────────
+def valid_bundle(counts):
+    # counts: dict{type: int}
+    return all(isinstance(v, int) and v >= 0 for v in counts.values()) and sum(counts.values()) > 0
+
+def has_bundle(grp, uid, counts):
+    if not counts:
+        return False
+    inv = inventory_counts(grp, uid)
+    for t, c in counts.items():
+        if c > 0 and inv.get(t, 0) < c:
+            return False
+    return True
+
+def normalize_bundle(d):
+    # drop zeros and sort keys (stable text)
+    return {t: int(c) for t, c in sorted(d.items()) if int(c) > 0}
+
+def propose_trade(grp, proposer_id, recipient_id, offer_counts, request_counts):
+    offer = normalize_bundle(offer_counts)
+    request = normalize_bundle(request_counts)
+    if not valid_bundle(offer) or not valid_bundle(request):
+        return "Invalid bundle."
+    if proposer_id == recipient_id:
         return "Cannot trade with yourself."
-    pg, rg = get_user_endowment(pid), get_user_endowment(rid)
-    if not (pg and rg):
-        return "Endowment missing."
-    row = fetchone(
-        """SELECT id FROM trades WHERE grp=? AND proposer_id=? AND recipient_id=?
-           AND proposer_good=? AND recipient_good=? AND status='pending'""",
-        (grp, pid, rid, pg, rg)
-    )
-    if row:
-        return "Trade already pending."
-    execute(
-        """INSERT INTO trades (grp, proposer_id, recipient_id, proposer_good, recipient_good, status)
-           VALUES (?,?,?,?,?,'pending')""",
-        (grp, pid, rid, pg, rg)
-    )
+    if not has_bundle(grp, proposer_id, offer):
+        return "You no longer have the items you’re offering."
+    if not has_bundle(grp, recipient_id, request):
+        return "Partner no longer has the items you’re requesting."
+    # Record proposal
+    execute("""INSERT INTO trades (grp, proposer_id, recipient_id, offer_json, request_json, status)
+               VALUES (?,?,?,?,?, 'pending')""",
+            (grp, proposer_id, recipient_id, json.dumps(offer), json.dumps(request)))
     return "Trade proposed."
 
-def incoming_trades(uid):
-    return fetchall(
-        """SELECT t.id, u.name, t.proposer_good, t.recipient_good, t.status, t.ts
-           FROM trades t JOIN users u ON u.id=t.proposer_id
-           WHERE t.recipient_id=? AND t.status='pending'""",
-        (uid,)
-    )
+def list_incoming(grp, uid):
+    return fetchall("""SELECT id, proposer_id, offer_json, request_json, ts
+                       FROM trades WHERE grp=? AND recipient_id=? AND status='pending'
+                       ORDER BY ts DESC""", (grp, uid))
 
-def outgoing_trades(uid):
-    return fetchall(
-        """SELECT t.id, v.name, t.proposer_good, t.recipient_good, t.status, t.ts
-           FROM trades t JOIN users v ON v.id=t.recipient_id
-           WHERE t.proposer_id=? AND t.status='pending'""",
-        (uid,)
-    )
+def list_outgoing(grp, uid):
+    return fetchall("""SELECT id, recipient_id, offer_json, request_json, ts
+                       FROM trades WHERE grp=? AND proposer_id=? AND status='pending'
+                       ORDER BY ts DESC""", (grp, uid))
 
-def update_trade_status(tid, status):
-    execute("UPDATE trades SET status=? WHERE id=?", (status, tid))
+def cancel_trade(grp, uid, trade_id):
+    row = fetchone("SELECT proposer_id, status FROM trades WHERE id=? AND grp=?", (trade_id, grp))
+    if row and row[0] == uid and row[1] == "pending":
+        execute("UPDATE trades SET status='cancelled' WHERE id=?", (trade_id,))
 
-def accept_trade(tid):
-    r = fetchone(
-        "SELECT grp, proposer_id, recipient_id, proposer_good, recipient_good, status FROM trades WHERE id=?",
-        (tid,)
-    )
-    if not r:
+def decline_trade(trade_id):
+    execute("UPDATE trades SET status='declined' WHERE id=?", (trade_id,))
+
+def accept_trade(grp, trade_id):
+    # Fetch and validate snapshot
+    row = fetchone("""SELECT proposer_id, recipient_id, offer_json, request_json, status
+                      FROM trades WHERE id=? AND grp=?""", (trade_id, grp))
+    if not row:
         return "Trade not found."
-    grp, pid, rid, pg, rg, status = r
+    proposer_id, recipient_id, offer_js, request_js, status = row
     if status != "pending":
         return "Trade no longer pending."
-    if get_user_endowment(pid) != pg or get_user_endowment(rid) != rg:
-        update_trade_status(tid, "declined")
-        return "Offer invalid."
-    execute("UPDATE endowments SET good=? WHERE user_id=?", (rg, pid))
-    execute("UPDATE endowments SET good=? WHERE user_id=?", (pg, rid))
-    update_trade_status(tid, "accepted")
-    return "Trade accepted and executed."
+    offer = json.loads(offer_js)
+    request = json.loads(request_js)
+    # Validate current availability
+    if not has_bundle(grp, proposer_id, offer):
+        execute("UPDATE trades SET status='declined' WHERE id=?", (trade_id,))
+        return "Offer invalid: proposer no longer has those items."
+    if not has_bundle(grp, recipient_id, request):
+        execute("UPDATE trades SET status='declined' WHERE id=?", (trade_id,))
+        return "Offer invalid: recipient no longer has requested items."
+    # Move concrete item copies
+    # Get specific item ids by type for each side
+    prop_items = inventory_items_by_type(grp, proposer_id)
+    recp_items = inventory_items_by_type(grp, recipient_id)
 
-def decline_trade(tid):
-    update_trade_status(tid, "declined")
+    # Transfer proposer→recipient (offer)
+    for t, c in offer.items():
+        ids = prop_items.get(t, [])[:c]
+        for iid in ids:
+            execute("UPDATE items SET owner_id=? WHERE id=?", (recipient_id, iid))
 
-def cancel_outgoing(tid, uid):
-    r = fetchone("SELECT proposer_id, status FROM trades WHERE id=?", (tid,))
-    if r and r[0] == uid and r[1] == "pending":
-        update_trade_status(tid, "cancelled")
+    # Transfer recipient→proposer (request)
+    for t, c in request.items():
+        ids = recp_items.get(t, [])[:c]
+        for iid in ids:
+            execute("UPDATE items SET owner_id=? WHERE id=?", (proposer_id, iid))
 
-def total_current_utility(grp):
-    r = fetchall(
-        """SELECT p.utility FROM users u
-           JOIN endowments e ON e.user_id=u.id
-           JOIN preferences p ON p.user_id=u.id AND p.good=e.good
-           WHERE u.grp=?""",
-        (grp,)
-    )
-    return sum(x[0] for x in r)
-
-def optimal_assignment(grp):
-    df = current_allocation_for_group(grp)
-    n = len(df)
-    if n == 0:
-        return 0, df, []
-    items = list(df["Good"])
-    util = preferences_matrix(grp, df, items)
-    try:
-        from scipy.optimize import linear_sum_assignment
-        r, c = linear_sum_assignment(-util)
-        best = int(util[r, c].sum())
-        assign = [(df.iloc[i]["Name"], items[c[i]], int(util[i, c[i]])) for i in range(n)]
-        return best, df, assign
-    except Exception:
-        remaining = set(range(n))
-        chosen = {}
-        total = 0
-        for i in range(n):
-            j = max(remaining, key=lambda k: util[i, k])
-            chosen[i] = j; remaining.remove(j)
-            total += int(util[i, j])
-        assign = [(df.iloc[i]["Name"], items[chosen[i]], int(util[i, chosen[i]])) for i in range(n)]
-        return total, df, assign
-
-# ─────────────────────────────────────────────
-# IR-Pareto tools parameterized by a baseline
-# ─────────────────────────────────────────────
-def _planner_state(grp):
-    """Return (users_df, items_labels, util_matrix, label_to_index) at CURRENT items ordering."""
-    users_df = current_allocation_for_group(grp)   # user_id, Name, Good
-    items = list(users_df["Good"])                 # labels of current items (columns of util)
-    util = preferences_matrix(grp, users_df, items)
-    label_to_index = {label: j for j, label in enumerate(items)}
-    return users_df, items, util, label_to_index
-
-def _baseline_self_vector(util, label_to_index, baseline_labels):
-    """base_self[i] = utility for user i at baseline allocation (by item label)."""
-    return np.array([util[i, label_to_index[baseline_labels[i]]] for i in range(len(baseline_labels))])
-
-def closest_ir_efficient_improvement_given_baseline(grp, baseline_labels):
-    """
-    Greedy TTC-style over the graph of acceptable edges: util[i,j] >= base_self[i],
-    'strict' if >. Repeatedly execute the strictly-improving cycle with the FEWEST
-    strictly-better participants, until none remain.
-    Returns (total_utility, strictly_better_count, assignment[(Name, Good)]).
-    """
-    users_df, items, util, label_to_index = _planner_state(grp)
-    n = len(users_df)
-    if n == 0:
-        return 0, 0, []
-    base_self = _baseline_self_vector(util, label_to_index, baseline_labels)
-
-    cur_items = items[:]  # labels by user index
-    strictly_better = set()
-
-    def build_targets():
-        # point to highest acceptable column j (>= base_self[i]); tie-break stay on current item index
-        targets = []
-        for i in range(n):
-            best_v = -10**9
-            best_j = label_to_index[cur_items[i]]  # staying index
-            for j in range(len(items)):
-                v = util[i, j]
-                if v < base_self[i]:  # not acceptable
-                    continue
-                if v > best_v or (v == best_v and j == best_j):
-                    best_v = v; best_j = j
-            targets.append(best_j)
-        return targets
-
-    def strict_edge(i, j):
-        return util[i, j] > base_self[i]
-
-    guard = 0
-    while True:
-        guard += 1
-        if guard > n * 5:
-            break
-        targets = build_targets()
-
-        # find cycles in functional graph
-        visited = [0]*n
-        cycles = []
-        for s in range(n):
-            if visited[s]: continue
-            seen = {}
-            cur = s
-            while not visited[cur]:
-                seen[cur] = len(seen)
-                visited[cur] = 1
-                cur = targets[cur]
-                if cur in seen:
-                    idx0 = seen[cur]
-                    cyc = [k for k, idx in sorted(seen.items(), key=lambda kv: kv[1]) if idx >= idx0]
-                    cycles.append(cyc)
-                    break
-
-        # keep cycles with at least one strict edge (true IR improvement)
-        improving = []
-        for cyc in cycles:
-            if any(strict_edge(i, targets[i]) for i in cyc if targets[i] != label_to_index[cur_items[i]]):
-                improving.append(cyc)
-        if not improving:
-            break
-
-        # choose the cycle with the FEWEST strictly-better participants
-        def strict_count(cyc):
-            return sum(1 for i in cyc if targets[i] != label_to_index[cur_items[i]] and strict_edge(i, targets[i]))
-        improving.sort(key=lambda cyc: (strict_count(cyc), len(cyc)))
-        chosen = improving[0]
-
-        # execute chosen cycle (each i gets item at targets[i])
-        new_items = cur_items[:]
-        for i in chosen:
-            new_items[i] = items[targets[i]]  # targets index refers to column j → label items[j]
-            if strict_edge(i, targets[i]):
-                strictly_better.add(i)
-        cur_items = new_items
-
-    # total utility for final cur_items
-    total = int(sum(util[i, label_to_index[cur_items[i]]] for i in range(n)))
-    assign = [(users_df.iloc[i]["Name"], cur_items[i]) for i in range(n)]
-    return total, int(len(strictly_better)), assign
-
-def util_max_ir_improvement_given_baseline(grp, baseline_labels):
-    """
-    Maximize total utility subject to util[i,j] >= base_self[i].
-    """
-    users_df, items, util, label_to_index = _planner_state(grp)
-    n = len(users_df)
-    if n == 0:
-        return 0, 0, []
-    base_self = _baseline_self_vector(util, label_to_index, baseline_labels)
-
-    allowed = util >= base_self.reshape(-1, 1)
-    restricted = util.astype(float).copy()
-    restricted[~allowed] = -1e6  # disallow
-
-    try:
-        from scipy.optimize import linear_sum_assignment
-        r, c = linear_sum_assignment(-restricted)  # maximize
-        total = int(util[r, c].sum())
-        strictly = int(sum(1 for i in range(n) if util[i, c[i]] > base_self[i]))
-        assign = [(users_df.iloc[i]["Name"], items[c[i]]) for i in range(n)]
-        return total, strictly, assign
-    except Exception:
-        # greedy fallback respecting IR
-        remaining = set(range(n))
-        chosen = {}
-        total = 0
-        strictly = 0
-        for i in range(n):
-            choices = [j for j in remaining if util[i, j] >= base_self[i]]
-            if not choices:
-                j = next(iter(remaining))
-            else:
-                j = max(choices, key=lambda jj: util[i, jj])
-            chosen[i] = j; remaining.remove(j)
-            total += int(util[i, j]); strictly += int(util[i, j] > base_self[i])
-        assign = [(users_df.iloc[i]["Name"], items[chosen[i]]) for i in range(n)]
-        return int(total), strictly, assign
+    execute("UPDATE trades SET status='accepted' WHERE id=?", (trade_id,))
+    return "Trade executed."
 
 # ─────────────────────────────────────────────
 # UI
@@ -455,20 +336,15 @@ def util_max_ir_improvement_given_baseline(grp, baseline_labels):
 init_db()
 
 with st.sidebar:
-    st.header("Bilateral Trading Game")
+    st.header("Bilateral Trading Game (Multi-Unit)")
     role = st.radio("Select role", role_options, index=0)
 
-    # Prefill from prior login if available
     prev_name, prev_grp = (st.session_state.get("who") or ("", ""))
-
-    grp = st.text_input("Group code", value=prev_grp, placeholder="e.g., A1 or econ101-1", key="grp_input")
-
+    grp = st.text_input("Group code", value=prev_grp, placeholder="e.g., A1 or econ101-1")
     if role == "Student":
-        name = st.text_input("Your name", value=prev_name, placeholder="First Last", key="name_input")
+        name = st.text_input("Your name", value=prev_name, placeholder="First Last")
         start_btn = st.button("Enter / Join Group")
 
-    # Auto-refresh controls
-    default_interval = 3 if role == "Social Planner" else 8
     auto = st.toggle("Auto-refresh", value=st.session_state["auto_refresh"])
     secs = st.number_input("Refresh every (s)", 2, 60, st.session_state["refresh_interval"], step=1)
     if auto != st.session_state["auto_refresh"] or secs != st.session_state["refresh_interval"]:
@@ -478,7 +354,9 @@ with st.sidebar:
 
 colA, colB = st.columns(2)
 
-# ── Student Role ─────────────────────────────
+# ─────────────────────────────────────────────
+# Student role
+# ─────────────────────────────────────────────
 if role == "Student":
     grp_clean = (grp or "").strip()
     name_clean = (name or "").strip() if "name" in locals() else ""
@@ -487,7 +365,11 @@ if role == "Student":
         if not grp_clean or not name_clean:
             st.info("Enter group and name in the sidebar to begin.")
         elif start_btn or True:
-            uid = get_or_create_user(name_clean, grp_clean)
+            try:
+                uid = get_or_create_user(name_clean, grp_clean)
+            except Exception as e:
+                st.error(str(e))
+                st.stop()
             st.session_state["user_id"] = uid
             st.session_state["who"] = (name_clean, grp_clean)
             st.rerun()
@@ -495,192 +377,177 @@ if role == "Student":
     if "user_id" in st.session_state:
         uid = st.session_state["user_id"]
         name_clean, grp_clean = st.session_state["who"]
+        status, k_cfg, t_cfg, active_types = get_group_state(grp_clean)
 
         with colA:
-            st.subheader("Your Endowment")
-            good = get_user_endowment(uid)
-            st.metric("You currently hold", good)
+            st.subheader("Your Inventory")
+            inv = inventory_counts(grp_clean, uid)
+            df = pd.DataFrame(
+                sorted([(t, inv.get(t, 0)) for t in (active_types or [])], key=lambda x: x[0]),
+                columns=["Type", "Count"]
+            )
+            st.dataframe(df, width="stretch", hide_index=True)
 
-            st.subheader("Your Preferences (active goods)")
-            prefs_df = get_user_prefs_df(uid)
-            active = active_goods_in_group(grp_clean)
-            if active:
-                prefs_df = prefs_df[prefs_df["Good"].isin(active)].sort_values("Good")
-            st.dataframe(prefs_df, width="stretch", hide_index=True)
-
-            st.subheader("Propose a Trade")
-            others = [(u[1], u[0]) for u in get_group_users(grp_clean) if u[0] != uid]
-            if not others:
-                st.warning("No one else yet.")
-            else:
-                partner_names = [x[0] for x in others]
-                target = st.selectbox("Partner", partner_names, key="partner_select")
-                tid = dict(others)[target]
-                their = get_user_endowment(tid)
-                st.write("Your item:", good)
-                st.write(target + "'s item:", their)
-                if st.button("Send offer"):
-                    st.success(propose_trade(grp_clean, uid, tid))
-                    st.rerun()
-
-            st.subheader("Outgoing Offers")
-            for t in outgoing_trades(uid):
-                id_, to, pg, rg, status, _ = t
-                with st.container(border=True):
-                    st.write("To " + to + ": " + pg + " ↔ " + rg + " (" + status + ")")
-                    if st.button("Cancel", key="c" + str(id_)):
-                        cancel_outgoing(id_, uid)
-                        st.rerun()
+            st.subheader("Your Preferences (active types)")
+            st.dataframe(prefs_df_for_user(uid, active_types), width="stretch", hide_index=True)
 
         with colB:
-            st.subheader("Incoming Offers")
-            inc = incoming_trades(uid)
-            for t in inc:
-                id_, frm, pg, rg, _, _ = t
-                with st.container(border=True):
-                    st.write("From " + frm + ": they give " + pg + ", you give " + rg)
-                    a, b = st.columns(2)
-                    if a.button("Accept", key="a" + str(id_)):
-                        st.success(accept_trade(id_))
-                        st.rerun()
-                    if b.button("Decline", key="d" + str(id_)):
-                        decline_trade(id_)
-                        st.rerun()
+            st.subheader("Group Status")
+            st.write("Status: " + status.upper())
+            roster = pd.DataFrame(get_group_users(grp_clean), columns=["user_id", "Name"])
+            st.dataframe(roster[["Name"]], width="stretch", hide_index=True)
 
-            st.subheader("Group Members")
-            st.dataframe(
-                current_allocation_for_group(grp_clean)[["Name", "Good"]],
-                width="stretch",
-                hide_index=True
-            )
+            if status == "waiting":
+                st.info("Waiting period — trades disabled until the planner starts the market.")
+            else:
+                st.subheader("Propose a Trade (1-for-1, 2-for-1, 1-for-2, or 2-for-2)")
+                others = [(u[1], u[0]) for u in get_group_users(grp_clean) if u[0] != uid]
+                if not others:
+                    st.warning("No one else in your group yet.")
+                else:
+                    partner_name = st.selectbox("Choose partner", [o[0] for o in others])
+                    partner_id = dict(others)[partner_name]
+                    inv_self = inventory_counts(grp_clean, uid)
+                    inv_partner = inventory_counts(grp_clean, partner_id)
 
-            if st.button("Refresh now"):
-                st.rerun()
+                    # Offer side (you give)
+                    st.markdown("**You offer**")
+                    offer_type1 = st.selectbox("Offer type 1", ["(none)"] + active_types, key="off1")
+                    offer_cnt1  = st.number_input("Count", 0, 2, 0, key="off1c")
+                    offer_type2 = st.selectbox("Offer type 2", ["(none)"] + active_types, key="off2")
+                    offer_cnt2  = st.number_input("Count ", 0, 2, 0, key="off2c")
 
-# ── Social Planner Role ──────────────────────
+                    # Request side (you receive)
+                    st.markdown("**You request**")
+                    req_type1 = st.selectbox("Request type 1", ["(none)"] + active_types, key="req1")
+                    req_cnt1  = st.number_input("Count  ", 0, 2, 0, key="req1c")
+                    req_type2 = st.selectbox("Request type 2", ["(none)"] + active_types, key="req2")
+                    req_cnt2  = st.number_input("Count   ", 0, 2, 0, key="req2c")
+
+                    offer = {}
+                    if offer_type1 != "(none)": offer[offer_type1] = offer_cnt1
+                    if offer_type2 != "(none)": offer[offer_type2] = offer.get(offer_type2, 0) + offer_cnt2
+                    request = {}
+                    if req_type1 != "(none)": request[req_type1] = req_cnt1
+                    if req_type2 != "(none)": request[req_type2] = request.get(req_type2, 0) + req_cnt2
+
+                    # Show quick availability hints
+                    if offer:
+                        missing = [t for t, c in offer.items() if c > inv_self.get(t, 0)]
+                        if missing:
+                            st.warning("You don't have enough of: " + ", ".join(missing))
+                    if request:
+                        missing = [t for t, c in request.items() if c > inv_partner.get(t, 0)]
+                        if missing:
+                            st.warning(partner_name + " doesn't have enough of: " + ", ".join(missing))
+
+                    if st.button("Send trade offer"):
+                        msg = propose_trade(grp_clean, uid, partner_id, offer, request)
+                        if msg == "Trade proposed.":
+                            st.success(msg)
+                            st.rerun()
+                        else:
+                            st.warning(msg)
+
+                st.subheader("Incoming Offers")
+                inc = list_incoming(grp_clean, uid)
+                if not inc:
+                    st.caption("No incoming offers.")
+                else:
+                    for tid, pid, offer_js, req_js, ts in inc:
+                        prop_name = fetchone("SELECT name FROM users WHERE id=?", (pid,))[0]
+                        offer = json.loads(offer_js); req = json.loads(req_js)
+                        with st.container(border=True):
+                            st.write("From: " + prop_name)
+                            st.write("They give you: " + json.dumps(req))
+                            st.write("You give them: " + json.dumps(offer))
+                            a, b = st.columns(2)
+                            if a.button("Accept", key="acc" + str(tid)):
+                                res = accept_trade(grp_clean, tid)
+                                if res.startswith("Trade executed"):
+                                    st.success(res)
+                                else:
+                                    st.warning(res)
+                                st.rerun()
+                            if b.button("Decline", key="dec" + str(tid)):
+                                decline_trade(tid); st.rerun()
+
+                st.subheader("Your Pending Outgoing Offers")
+                out = list_outgoing(grp_clean, uid)
+                if not out:
+                    st.caption("No outgoing offers.")
+                else:
+                    for tid, rid, offer_js, req_js, ts in out:
+                        rec_name = fetchone("SELECT name FROM users WHERE id=?", (rid,))[0]
+                        with st.container(border=True):
+                            st.write("To: " + rec_name)
+                            st.write("You offer: " + offer_js)
+                            st.write("You request: " + req_js)
+                            if st.button("Cancel", key="can" + str(tid)):
+                                cancel_trade(grp_clean, uid, tid); st.rerun()
+
+# ─────────────────────────────────────────────
+# Planner role
+# ─────────────────────────────────────────────
 elif role == "Social Planner":
     if not grp:
         st.info("Enter a group code in the sidebar.")
     else:
-        df = current_allocation_for_group(grp)
-        if df.empty:
-            st.warning("No students yet.")
+        ensure_group_row(grp)
+        status, k_cfg, t_cfg, active_types = get_group_state(grp)
+
+        st.title("Social Planner")
+        st.markdown("**Group:** " + grp + " · **Status:** " + status.upper())
+
+        with st.expander("Roster"):
+            roster = pd.DataFrame(get_group_users(grp), columns=["user_id", "Name"])
+            st.dataframe(roster[["Name"]], width="stretch", hide_index=True)
+
+        st.subheader("Configuration")
+        k_new = st.number_input("Units per student (K)", 1, 10, k_cfg)
+        t_new = st.number_input("Number of distinct types (T)", 2, min(12, len(MASTER_GOODS)), min(t_cfg, len(MASTER_GOODS)))
+        st.caption("Types are sampled from a master list; duplicates in inventories are allowed.")
+        if st.button("Save config (does not start market)"):
+            set_group_config(grp, k=int(k_new), t=int(t_new))
+            st.success("Config saved.")
+
+        st.subheader("Start / Reset")
+        if status == "waiting":
+            if st.button("Start Market"):
+                # Pick T types, allocate K per student
+                types = random.sample(MASTER_GOODS, int(t_new))
+                set_group_config(grp, status="started", k=int(k_new), t=int(t_new), types=types)
+                allocate_initial_items(grp, int(k_new), types)
+                st.success("Market started with " + str(k_new) + " units per student and " + str(t_new) + " types.")
+                st.rerun()
         else:
-            st.title("Social Planner Dashboard")
-
-            with st.expander("Current Allocation", expanded=True):
-                st.dataframe(df[["Name", "Good"]], width="stretch", hide_index=True)
-
-            cur_total = total_current_utility(grp)
-            max_total, _, assign = optimal_assignment(grp)
-            c1, c2 = st.columns(2)
-            c1.metric("Current Total Utility", cur_total)
-            c2.metric("Max Possible Total Utility", max_total)
-
-            rows = fetchall(
-                """SELECT u.name, e.good, p.utility
-                   FROM users u
-                   JOIN endowments e ON e.user_id=u.id
-                   JOIN preferences p ON p.user_id=u.id AND p.good=e.good
-                   WHERE u.grp=? ORDER BY u.name""",
-                (grp,)
-            )
-            st.subheader("Per-Student Utilities")
-            st.dataframe(pd.DataFrame(rows, columns=["Name", "Good", "Utility"]),
-                         width="stretch", hide_index=True)
-
-            # ── Efficiency Dashboard (IR vs ORIGINAL and vs CURRENT) ─────────
-            st.divider()
-            st.subheader("Efficiency Dashboard (IR-constrained)")
-
-            # Baselines
-            users_df, items_now, util_now, label_to_index = _planner_state(grp)
-            original_df = original_allocation_for_group(grp)
-
-            # Build baseline label vectors aligned with users_df order
-            # (users_df and original_df are both ordered by name)
-            base_original = list(original_df["Good"])
-            base_current  = list(users_df["Good"])  # current identity
-
-            # 1) Closest Efficient IR-Improvement (vs ORIGINAL)
-            ceo_total, ceo_strict, ceo_assign = closest_ir_efficient_improvement_given_baseline(grp, base_original)
-            # 2) Utility-Max IR-Improvement (vs ORIGINAL)
-            umo_total, umo_strict, umo_assign = util_max_ir_improvement_given_baseline(grp, base_original)
-            # 3) Closest Efficient IR-Improvement (vs CURRENT)
-            cec_total, cec_strict, cec_assign = closest_ir_efficient_improvement_given_baseline(grp, base_current)
-            # 4) Utility-Max IR-Improvement (vs CURRENT)
-            umc_total, umc_strict, umc_assign = util_max_ir_improvement_given_baseline(grp, base_current)
-
-            # Present in two rows
-            r1c1, r1c2 = st.columns(2)
-            with r1c1:
-                st.caption("Closest Efficient IR-Improvement **vs Original**")
-                st.metric("People strictly better off", ceo_strict)
-                st.metric("Total utility in allocation", ceo_total, delta=ceo_total - cur_total)
-                with st.expander("Show assignment"):
-                    if ceo_assign:
-                        st.dataframe(pd.DataFrame(ceo_assign, columns=["Name", "Assigned Good"]),
-                                     width="stretch", hide_index=True)
-                    else:
-                        st.caption("No IR-improving cycles vs original (already IR-efficient).")
-
-            with r1c2:
-                st.caption("Utility-Max IR-Improvement **vs Original**")
-                st.metric("People strictly better off", umo_strict)
-                st.metric("Total utility in allocation", umo_total, delta=umo_total - cur_total)
-                with st.expander("Show assignment"):
-                    if umo_assign:
-                        st.dataframe(pd.DataFrame(umo_assign, columns=["Name", "Assigned Good"]),
-                                     width="stretch", hide_index=True)
-                    else:
-                        st.caption("No IR-feasible improvement vs original.")
-
-            r2c1, r2c2 = st.columns(2)
-            with r2c1:
-                st.caption("Closest Efficient IR-Improvement **vs Current**")
-                st.metric("People strictly better off", cec_strict)
-                st.metric("Total utility in allocation", cec_total, delta=cec_total - cur_total)
-                with st.expander("Show assignment"):
-                    if cec_assign:
-                        st.dataframe(pd.DataFrame(cec_assign, columns=["Name", "Assigned Good"]),
-                                     width="stretch", hide_index=True)
-                    else:
-                        st.caption("No IR-improving cycles vs current (already IR-efficient).")
-
-            with r2c2:
-                st.caption("Utility-Max IR-Improvement **vs Current**")
-                st.metric("People strictly better off", umc_strict)
-                st.metric("Total utility in allocation", umc_total, delta=umc_total - cur_total)
-                with st.expander("Show assignment"):
-                    if umc_assign:
-                        st.dataframe(pd.DataFrame(umc_assign, columns=["Name", "Assigned Good"]),
-                                     width="stretch", hide_index=True)
-                    else:
-                        st.caption("No IR-feasible improvement vs current.")
-
-            st.caption("All four allocations enforce individual rationality (IR) relative to the stated baseline. "
-                       "‘Closest’ executes the smallest strictly-improving cycles until no more IR-improvements remain; "
-                       "‘Utility-Max’ solves a Hungarian assignment restricted to IR-feasible edges.")
-
-            # ── Admin Controls ───────────────────────────────────────────────
-            st.divider(); st.subheader("Admin Controls")
-            with st.expander("Danger Zone — Reset Data", expanded=False):
-                cA, cB = st.columns(2)
-                with cA:
-                    allc = st.checkbox("Confirm reset ALL", key="rall")
-                    if st.button("⚠️ Reset ALL Data", disabled=not allc):
-                        reset_all_data(); st.success("All data cleared."); st.rerun()
-                with cB:
-                    one = st.checkbox("Confirm reset group", key="rgrp")
-                    if st.button("♻️ Reset This Group", disabled=not one):
-                        reset_group(grp); st.success("Group cleared."); st.rerun()
-
-            if st.button("Refresh now"):
+            st.caption("Market is running. New students cannot join until reset.")
+            if st.button("♻️ Reset Group"):
+                reset_group(grp)
+                st.success("Group reset to waiting.")
                 st.rerun()
 
+        st.subheader("Active Types & Totals")
+        status, k_cfg, t_cfg, active_types = get_group_state(grp)
+        st.write("Active types: " + (", ".join(active_types) if active_types else "(none)"))
+
+        if status == "started":
+            users = get_group_users(grp)
+            # Inventory table
+            rows = []
+            for uid, nm in users:
+                counts = inventory_counts(grp, uid)
+                rows.append(
+                    {"Name": nm, **{t: counts.get(t, 0) for t in active_types},
+                     "Distinct types": sum(1 for t in active_types if counts.get(t, 0) > 0),
+                     "Utility": bundle_utility(uid, {t for t in active_types if counts.get(t, 0) > 0})}
+                )
+            st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
+            st.metric("Total utility (set utility)", current_total_utility(grp))
+
 # ─────────────────────────────────────────────
-# Global timed rerun (fires even when no one clicks)
+# Global timed rerun
 # ─────────────────────────────────────────────
 if st.session_state.get("auto_refresh", False):
-    time.sleep(int(st.session_state.get("refresh_interval", 5)))
+    time.sleep(int(st.session_state.get("refresh_interval", 6)))
     st.rerun()
