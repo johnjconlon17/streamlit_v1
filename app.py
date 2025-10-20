@@ -307,7 +307,7 @@ if role == "Student":
             st.metric("You currently hold", good)
 
             st.subheader("Your Preferences")
-            st.dataframe(get_user_prefs_df(uid), use_container_width=True, hide_index=True)
+            st.dataframe(get_user_prefs_df(uid), width='stretch', hide_index=True)
 
             st.subheader("Propose a Trade")
             others = [(u[1], u[0]) for u in get_group_users(grp_clean) if u[0] != uid]
@@ -351,7 +351,7 @@ if role == "Student":
             st.subheader("Group Members")
             st.dataframe(
                 current_allocation_for_group(grp_clean)[["Name", "Good"]],
-                use_container_width=True,
+                width='stretch',
                 hide_index=True
             )
 
@@ -370,7 +370,7 @@ elif role == "Social Planner":
             st.title("Social Planner Dashboard")
 
             with st.expander("Current Allocation", expanded=True):
-                st.dataframe(df[["Name", "Good"]], use_container_width=True, hide_index=True)
+                st.dataframe(df[["Name", "Good"]], width='stretch', hide_index=True)
 
             cur = total_current_utility(grp)
             maxu, _, assign = optimal_assignment(grp)
@@ -388,12 +388,12 @@ elif role == "Social Planner":
             )
             st.subheader("Per-Student Utilities")
             st.dataframe(pd.DataFrame(rows, columns=["Name", "Good", "Utility"]),
-                         use_container_width=True, hide_index=True)
+                         width='stretch', hide_index=True)
 
             st.subheader("One Optimal Assignment")
             if assign:
                 st.dataframe(pd.DataFrame(assign, columns=["Name", "Assigned Good", "Utility"]),
-                             use_container_width=True, hide_index=True)
+                             width='stretch', hide_index=True)
             else:
                 st.caption("Not enough data yet.")
 
