@@ -1,7 +1,12 @@
 # app.py
-# Streamlit Pareto Efficiency Dashboard + Trade Proposal UI
-# Requires: streamlit, pandas, numpy, pulp
-#   pip install streamlit pandas numpy pulp
+# Streamlit Allocation Planner with Admin/Participant Views
+# Requires: streamlit>=1.37, pandas>=2.0, numpy>=1.25, pulp, (optional) scipy
+# On Streamlit Cloud, include in requirements.txt:
+# streamlit>=1.37
+# pandas>=2.0
+# numpy>=1.25
+# scipy>=1.10
+# pulp
 
 import streamlit as st
 import pandas as pd
@@ -11,10 +16,58 @@ import pulp
 
 st.set_page_config(page_title="Allocation Planner", layout="wide")
 
-# ------------------------------
-# Helpers
-# ------------------------------
 
+# ------------------------------------------------------------
+# URL Param Role Detection
+# ------------------------------------------------------------
+def get_role_from_query() -> str:
+    """
+    Determine role from ?admin= URL param.
+    Returns "planner" if admin in ("1","true","yes"), else "participant".
+    """
+    # Streamlit >=1.26: st.query_params; older fallback: experimental_get_query_params
+    try:
+        admin_val = st.query_params.get("admin", "0")
+    except Exception:
+        admin_val = (st.experimental_get_query_params().get("admin", ["0"])[0])
+
+    admin_val = str(admin_val).lower()
+    is_admin = admin_val in ("1", "true", "yes")
+    return "planner" if is_admin else "participant"
+
+
+def set_role_in_url(is_admin: bool) -> None:
+    """
+    Update URL query param to flip views; supported on Cloud.
+    """
+    try:
+        st.query_params["admin"] = "1" if is_admin else "0"
+    except Exception:
+        # Older fallback
+        params = st.experimental_get_query_params()
+        params["admin"] = ["1" if is_admin else "0"]
+        st.experimental_set_query_params(**params)
+
+
+role = get_role_from_query()
+
+top_cols = st.columns([1, 1, 3])
+with top_cols[0]:
+    if st.button("Switch to Planner view"):
+        set_role_in_url(True)
+        st.rerun()
+with top_cols[1]:
+    if st.button("Switch to Participant view"):
+        set_role_in_url(False)
+        st.rerun()
+with top_cols[2]:
+    badge = "👑 Planner (admin=1)" if role == "planner" else "🧑‍🎓 Participant (admin=0)"
+    st.markdown(f"**View:** {badge}")
+
+
+# ------------------------------------------------------------
+# Helpers & State
+# ------------------------------------------------------------
 def ensure_state():
     """Initialize example data if none exists."""
     if "people" not in st.session_state:
@@ -26,8 +79,7 @@ def ensure_state():
     g = len(st.session_state.goods)
 
     if "utilities_df" not in st.session_state:
-        # Per-unit utility values (editable in UI)
-        # rows = people, cols = goods
+        # Per-unit utility values (editable)
         vals = np.array([
             [8, 6, 2],
             [5, 7, 3],
@@ -40,15 +92,12 @@ def ensure_state():
         )
 
     if "stock_df" not in st.session_state:
-        # Total available units for each good (editable in UI)
         st.session_state.stock_df = pd.DataFrame(
             {"Total Available": [6, 6, 6][:g]},
             index=st.session_state.goods
         )
 
     if "allocation_df" not in st.session_state:
-        # Current allocation: rows = people, cols = goods
-        # (editable)
         alloc = np.array([
             [2, 1, 0],
             [2, 2, 1],
@@ -91,17 +140,13 @@ def solve_pareto_improvement(
     """
     Test if a Pareto-improving allocation exists (continuous).
     If exists, return improved allocation.
-    We maximize the sum of utilities subject to:
-      - Good totals <= stock
-      - Each person's utility >= current utility (+ tiny epsilon on objective via "improve at least one")
-    Then we *also* check if everybody is weakly >= current and someone strictly > current by >= 1e-8.
+
+    Maximize sum_i,g u[i,g]*x[i,g]
+    s.t.    sum_i x[i,g] <= stock[g]
+            sum_g u[i,g]*x[i,g] >= current utility_i   (IR constraints)
 
     Returns:
       (is_efficient, improved_alloc, deltas, debug_info)
-      - is_efficient: True if NO improvement exists (current is Pareto efficient in the continuous sense).
-      - improved_alloc: if improvement exists, the found allocation; else a copy of current_alloc
-      - deltas: per-person Δutility and per-good transfers if improvement exists (None otherwise)
-      - debug_info: LP status and diagnostic details
     """
     people = list(utilities_df.index)
     goods = list(utilities_df.columns)
@@ -113,57 +158,44 @@ def solve_pareto_improvement(
     prob = pulp.LpProblem("ParetoImprove", pulp.LpMaximize)
 
     # Decision vars x[i,g] >= 0
-    x_vars = {
-        (i, g): pulp.LpVariable(f"x_{i}_{g}", lowBound=0)
-        for i in people for g in goods
-    }
+    x_vars = {(i, g): pulp.LpVariable(f"x_{i}_{g}", lowBound=0) for i in people for g in goods}
 
-    # Objective: maximize sum_i,g u[i,g]*x[i,g]
+    # Objective
     prob += pulp.lpSum(utilities_df.loc[i, g] * x_vars[(i, g)] for i in people for g in goods)
 
     # Goods availability
     for g in goods:
-        prob += pulp.lpSum(x_vars[(i, g)] for i in people) <= float(stock[g])  # respect total stock
+        prob += pulp.lpSum(x_vars[(i, g)] for i in people) <= float(stock[g])
 
-    # IR constraints (weak Pareto improvement)
+    # IR constraints: weak Pareto improvement
     for i in people:
         lhs = pulp.lpSum(utilities_df.loc[i, g] * x_vars[(i, g)] for g in goods)
-        prob += lhs >= float(u_now[i])  # everyone at least as well off
+        prob += lhs >= float(u_now[i])
 
-    # Solve
     status = prob.solve(pulp.PULP_CBC_CMD(msg=False))
+    debug = {"status": pulp.LpStatus[status], "objective_value": pulp.value(prob.objective)}
 
-    debug = {
-        "status": pulp.LpStatus[status],
-        "objective_value": pulp.value(prob.objective)
-    }
-
-    # Build proposed allocation
+    # Build candidate allocation
     X = pd.DataFrame(0.0, index=people, columns=goods)
     for i in people:
         for g in goods:
-            X.loc[i, g] = x_vars[(i, g)].value() if x_vars[(i, g)].value() is not None else 0.0
+            val = x_vars[(i, g)].value()
+            X.loc[i, g] = val if val is not None else 0.0
 
-    # Check improvement condition: all >= current, and someone strictly greater
     u_candidate = compute_utilities(utilities_df, X)
     weakly_better = (u_candidate + 1e-10 >= u_now).all()
     strictly = (u_candidate > u_now + 1e-8).any()
 
     if pulp.LpStatus[status] != "Optimal" or not weakly_better or not strictly:
-        # No Pareto improvement found: treat as efficient (in this continuous model)
-        return True, current_alloc.copy(), None, debug
+        return True, current_alloc.copy(), None, debug  # Treat as efficient (continuous model)
 
-    # Otherwise: improvement exists
-    # Produce delta summaries
     deltas = {}
-
     deltas["utility"] = pd.DataFrame({
         "Current U": u_now,
         "Proposed U": u_candidate,
         "ΔU": u_candidate - u_now
     })
 
-    # Transfers per good = proposed minus current => who gives/receives
     transfer = X - current_alloc
     deltas["transfers"] = transfer
 
@@ -173,19 +205,16 @@ def solve_pareto_improvement(
 def summarize_swaps(transfer_df: pd.DataFrame) -> pd.DataFrame:
     """
     Convert transfer matrix (proposed - current) into a tidy list of who gives what to whom.
-    Positive means receiving; negative means giving.
-    We construct a flow decomposition for each good.
+    Positive => receiving; negative => giving. Greedy flow per good for readability.
     """
     people = list(transfer_df.index)
     goods = list(transfer_df.columns)
 
     rows = []
     for g in goods:
-        # build supply (negative) and demand (positive) lists
         gives = [(p, -transfer_df.loc[p, g]) for p in people if transfer_df.loc[p, g] < -1e-9]
-        gets = [(p, transfer_df.loc[p, g]) for p in people if transfer_df.loc[p, g] > 1e-9]
+        gets  = [(p,  transfer_df.loc[p, g]) for p in people if transfer_df.loc[p, g] >  1e-9]
 
-        # Greedy match supply->demand for a readable swap list
         gi, ge = 0, 0
         gives = list(gives)
         gets = list(gets)
@@ -193,14 +222,9 @@ def summarize_swaps(transfer_df: pd.DataFrame) -> pd.DataFrame:
             giver, qty_give = gives[gi]
             receiver, qty_get = gets[ge]
             amt = min(qty_give, qty_get)
-            rows.append({
-                "Good": g,
-                "From": giver,
-                "To": receiver,
-                "Quantity": float(amt)
-            })
+            rows.append({"Good": g, "From": giver, "To": receiver, "Quantity": float(amt)})
             qty_give -= amt
-            qty_get -= amt
+            qty_get  -= amt
             if qty_give <= 1e-12:
                 gi += 1
             else:
@@ -213,175 +237,188 @@ def summarize_swaps(transfer_df: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-# ------------------------------
-# UI
-# ------------------------------
+def reindex_all_frames():
+    """Keep frames aligned after edits to people/goods."""
+    people = st.session_state.people
+    goods = st.session_state.goods
 
+    st.session_state.utilities_df = st.session_state.utilities_df.reindex(
+        index=people, columns=goods, fill_value=0.0
+    )
+    st.session_state.stock_df = st.session_state.stock_df.reindex(index=goods).fillna(0.0)
+    st.session_state.allocation_df = st.session_state.allocation_df.reindex(
+        index=people, columns=goods, fill_value=0.0
+    )
+
+
+# ------------------------------------------------------------
+# App Body
+# ------------------------------------------------------------
 ensure_state()
+reindex_all_frames()
 
-st.title("Planner: Efficiency Dashboard & Trade Proposals")
-
-with st.expander("Edit People & Goods"):
-    c1, c2 = st.columns([1, 1])
-    with c1:
-        new_people = st.text_area("People (one per line)", "\n".join(st.session_state.people))
-        if st.button("Update People"):
-            st.session_state.people = [p.strip() for p in new_people.splitlines() if p.strip()]
-    with c2:
-        new_goods = st.text_area("Goods (one per line)", "\n".join(st.session_state.goods))
-        if st.button("Update Goods"):
-            st.session_state.goods = [g.strip() for g in new_goods.splitlines() if g.strip()]
-
-# Reindex frames if people/goods changed
+# Shared data references
 people = st.session_state.people
 goods = st.session_state.goods
-
-# Reindex utilities
-st.session_state.utilities_df = st.session_state.utilities_df.reindex(index=people, columns=goods, fill_value=0.0)
-# Reindex stock
-st.session_state.stock_df = st.session_state.stock_df.reindex(index=goods).fillna(0.0)
-# Reindex allocation
-st.session_state.allocation_df = st.session_state.allocation_df.reindex(index=people, columns=goods, fill_value=0.0)
-
-st.header("Inputs")
-
-c_util, c_stock = st.columns([2, 1])
-with c_util:
-    st.subheader("Per-Unit Utilities (people × goods)")
-    st.dataframe(st.session_state.utilities_df, use_container_width=True)
-with c_stock:
-    st.subheader("Total Stock by Good")
-    st.dataframe(st.session_state.stock_df, use_container_width=True)
-
-st.subheader("Current Allocation (people × goods)")
-st.caption("You can edit this table directly. Totals per good should not exceed stock; if they do, we'll scale down proportionally (for feasibility checks).")
-edited_alloc = st.dataframe(
-    st.session_state.allocation_df,
-    use_container_width=True,
-    height=200
-)
-# Provide a quick “apply edits” button by reading back from session (Streamlit doesn't auto-return edited df directly here).
-if st.button("Apply any manual edits to allocation"):
-    st.experimental_rerun()
-
-# Clamp to stock (soft enforcement)
-A_current = clamp_allocation_to_stock(st.session_state.allocation_df, st.session_state.stock_df["Total Available"])
-if not A_current.equals(st.session_state.allocation_df):
-    st.info("Current allocation exceeded stock on at least one good; scaled proportionally to fit totals.")
-    st.session_state.allocation_df = A_current.copy()
-
-# ------------------------------
-# Efficiency Dashboard (Planner)
-# ------------------------------
-st.header("Efficiency Dashboard (Planner)")
-
 utilities_df = st.session_state.utilities_df.copy().astype(float)
 stock = st.session_state.stock_df["Total Available"].copy().astype(float)
 current_alloc = st.session_state.allocation_df.copy().astype(float)
 
-u_now = compute_utilities(utilities_df, current_alloc)
-c1, c2, c3 = st.columns([1, 1, 1])
-with c1:
-    st.metric("Social Welfare (sum of utilities)", f"{u_now.sum():.3f}")
-with c2:
-    st.metric("Min Individual Utility", f"{u_now.min():.3f}")
-with c3:
-    st.metric("Max Individual Utility", f"{u_now.max():.3f}")
 
-is_eff, proposed_alloc, deltas, debug = solve_pareto_improvement(
-    utilities_df, stock, current_alloc, epsilon=1e-6
-)
+# ============================================================
+# PLANNER (ADMIN) VIEW
+# ============================================================
+if role == "planner":
+    st.title("Planner: Efficiency Dashboard & Controls")
 
-if is_eff:
-    st.success("✅ Current allocation is Pareto efficient (under continuous quantities).")
-    with st.expander("Debug (LP)"):
-        st.json(debug)
-else:
-    st.error("❗ Current allocation is **not** Pareto efficient (continuous).")
-    st.subheader("One Pareto-Improving Reallocation (continuous)")
+    with st.expander("Edit People & Goods"):
+        c1, c2 = st.columns([1, 1])
+        with c1:
+            new_people = st.text_area("People (one per line)", "\n".join(people))
+            if st.button("Update People"):
+                st.session_state.people = [p.strip() for p in new_people.splitlines() if p.strip()]
+                reindex_all_frames()
+                st.rerun()
+        with c2:
+            new_goods = st.text_area("Goods (one per line)", "\n".join(goods))
+            if st.button("Update Goods"):
+                st.session_state.goods = [g.strip() for g in new_goods.splitlines() if g.strip()]
+                reindex_all_frames()
+                st.rerun()
 
-    # Show utilities change
-    st.markdown("**Utilities**")
-    st.dataframe(deltas["utility"], use_container_width=True)
+    # Refresh references after potential edits
+    people = st.session_state.people
+    goods = st.session_state.goods
+    utilities_df = st.session_state.utilities_df.copy().astype(float)
+    stock = st.session_state.stock_df["Total Available"].copy().astype(float)
+    current_alloc = st.session_state.allocation_df.copy().astype(float)
 
-    # Show proposed allocation
-    st.markdown("**Proposed Allocation**")
-    st.dataframe(proposed_alloc, use_container_width=True)
+    st.header("Inputs")
+    c_util, c_stock = st.columns([2, 1])
+    with c_util:
+        st.subheader("Per-Unit Utilities (people × goods)")
+        st.dataframe(utilities_df, use_container_width=True)
+    with c_stock:
+        st.subheader("Total Stock by Good")
+        st.dataframe(st.session_state.stock_df, use_container_width=True)
 
-    # Transfers view
-    st.markdown("**Transfers (Proposed − Current)**")
-    transfer_df = deltas["transfers"]
-    st.dataframe(transfer_df, use_container_width=True)
+    st.subheader("Current Allocation (people × goods)")
+    st.caption("Edit as needed. If totals exceed stock for any good, we scale down proportionally for feasibility checks.")
+    st.dataframe(current_alloc, use_container_width=True, height=220)
 
-    # Swap summary (readable multilateral trades)
-    st.markdown("**Implied Swaps (multilateral allowed)**")
-    swap_df = summarize_swaps(transfer_df)
-    if swap_df.empty:
-        st.write("No net transfers needed (difference is negligible).")
+    # Soft clamp to stock (doesn't overwrite user input silently)
+    clamped = clamp_allocation_to_stock(current_alloc, stock)
+    if not clamped.equals(current_alloc):
+        st.info("Current allocation exceeded stock for ≥1 good; using a scaled version for feasibility/efficiency checks below.")
+    A_for_check = clamped
+
+    # Metrics
+    u_now = compute_utilities(utilities_df, A_for_check)
+    c1, c2, c3 = st.columns([1, 1, 1])
+    with c1:
+        st.metric("Social Welfare (Σ utilities)", f"{u_now.sum():.3f}")
+    with c2:
+        st.metric("Min Individual Utility", f"{u_now.min():.3f}")
+    with c3:
+        st.metric("Max Individual Utility", f"{u_now.max():.3f}")
+
+    # Efficiency check via LP
+    is_eff, proposed_alloc, deltas, debug = solve_pareto_improvement(
+        utilities_df, stock, A_for_check, epsilon=1e-6
+    )
+
+    st.header("Efficiency Dashboard")
+    if is_eff:
+        st.success("✅ Current allocation is Pareto efficient (continuous quantities).")
+        with st.expander("Debug (LP)"):
+            st.json(debug)
     else:
-        st.dataframe(swap_df, use_container_width=True)
+        st.error("❗ Current allocation is **not** Pareto efficient (continuous).")
+        st.subheader("One Pareto-Improving Reallocation (continuous)")
 
-    with st.expander("Debug (LP)"):
-        st.json(debug)
+        st.markdown("**Utilities**")
+        st.dataframe(deltas["utility"], use_container_width=True)
 
-# ------------------------------
-# Participant Trade Proposal UI
-# ------------------------------
-st.header("Participant Trade Proposals")
+        st.markdown("**Proposed Allocation**")
+        st.dataframe(proposed_alloc, use_container_width=True)
 
-st.caption("Build a natural-language proposal with dropdowns. This does **not** change the allocation; it just formats a proposal you can collect from participants.")
+        st.markdown("**Transfers (Proposed − Current)**")
+        transfer_df = deltas["transfers"]
+        st.dataframe(transfer_df, use_container_width=True)
 
-people = st.session_state.people
-goods = st.session_state.goods
+        st.markdown("**Implied Swaps (multilateral allowed)**")
+        swap_df = summarize_swaps(transfer_df)
+        if swap_df.empty:
+            st.write("No net transfers needed (difference is negligible).")
+        else:
+            st.dataframe(swap_df, use_container_width=True)
 
-colp = st.columns(2)
-with colp[0]:
-    giver = st.selectbox("I am (the proposer)", people, key="tp_giver")
-    recipient = st.selectbox("Proposing to", [p for p in people if p != giver] or people, key="tp_recipient")
-with colp[1]:
-    give_good = st.selectbox("I’d give (Good)", goods, key="tp_give_good")
-    give_qty = st.number_input("Quantity to give", min_value=0.0, step=1.0, value=1.0, key="tp_give_qty")
+        with st.expander("Debug (LP)"):
+            st.json(debug)
 
-colq = st.columns(2)
-with colq[0]:
-    get_good = st.selectbox("…in exchange for (Good)", goods, key="tp_get_good")
-with colq[1]:
-    get_qty = st.number_input("Quantity to receive", min_value=0.0, step=1.0, value=1.0, key="tp_get_qty")
+    st.divider()
+    st.caption("Note: The test uses a continuous LP relaxation. If you need indivisible/integer items or a shortest-move improvement, we can switch to an MILP or add alternative objectives.")
 
-# Availability hints
-st.caption("Availability check (based on current allocation):")
-avail_cols = st.columns(2)
-with avail_cols[0]:
-    st.write(f"{giver} currently holds:")
-    st.dataframe(current_alloc.loc[[giver]].T.rename(columns={giver: "Qty"}))
-with avail_cols[1]:
-    st.write(f"{recipient} currently holds:")
-    st.dataframe(current_alloc.loc[[recipient]].T.rename(columns={recipient: "Qty"}))
 
-# Build sentence
-if give_qty > 0 and get_qty > 0:
-    proposal = f"I'd give {recipient} {give_qty:g} {give_good} in exchange for {get_qty:g} {get_good}."
+# ============================================================
+# PARTICIPANT (STUDENT) VIEW
+# ============================================================
 else:
-    proposal = "Please choose positive quantities to form a proposal."
+    st.title("Participant: Trade Proposals")
 
-st.subheader("Proposal")
-st.write(proposal)
+    # Use current session data (read-only for participants, but visible)
+    people = st.session_state.people
+    goods = st.session_state.goods
+    utilities_df = st.session_state.utilities_df.copy().astype(float)
+    stock = st.session_state.stock_df["Total Available"].copy().astype(float)
+    current_alloc = st.session_state.allocation_df.copy().astype(float)
 
-# Optional validation messages
-problems = []
-if give_qty > current_alloc.loc[giver, give_good] + 1e-12:
-    problems.append(f"{giver} only has {current_alloc.loc[giver, give_good]:g} of {give_good} to give.")
+    st.caption("Build a natural-language trade proposal. This does **not** execute trades.")
 
-if get_qty > current_alloc.loc[recipient, get_good] + 1e-12:
-    problems.append(f"{recipient} only has {current_alloc.loc[recipient, get_good]:g} of {get_good} to trade.")
+    colp = st.columns(2)
+    with colp[0]:
+        giver = st.selectbox("I am (the proposer)", people, key="tp_giver")
+        recipient = st.selectbox("Proposing to", [p for p in people if p != giver] or people, key="tp_recipient")
+    with colp[1]:
+        give_good = st.selectbox("I’d give (Good)", goods, key="tp_give_good")
+        give_qty = st.number_input("Quantity to give", min_value=0.0, step=1.0, value=1.0, key="tp_give_qty")
 
-if give_good == get_good and give_qty == get_qty and giver != recipient and give_qty > 0:
-    problems.append("Trading the same good for the same quantity is a wash.")
+    colq = st.columns(2)
+    with colq[0]:
+        get_good = st.selectbox("…in exchange for (Good)", goods, key="tp_get_good")
+    with colq[1]:
+        get_qty = st.number_input("Quantity to receive", min_value=0.0, step=1.0, value=1.0, key="tp_get_qty")
 
-if problems:
-    st.warning(" ".join(problems))
-else:
-    st.info("Looks coherent given current holdings (this does not execute the trade).")
+    st.caption("Availability check (based on current allocation):")
+    avail_cols = st.columns(2)
+    with avail_cols[0]:
+        st.write(f"{giver} currently holds:")
+        st.dataframe(current_alloc.loc[[giver]].T.rename(columns={giver: "Qty"}))
+    with avail_cols[1]:
+        st.write(f"{recipient} currently holds:")
+        st.dataframe(current_alloc.loc[[recipient]].T.rename(columns={recipient: "Qty"}))
 
-st.divider()
-st.caption("Notes: Efficiency test uses a continuous LP relaxation. If you need indivisible/integer items or minimal-distance improvements, we can switch to an MILP or shortest-move formulation.")
+    if give_qty > 0 and get_qty > 0:
+        proposal = f"I'd give {recipient} {give_qty:g} {give_good} in exchange for {get_qty:g} {get_good}."
+    else:
+        proposal = "Please choose positive quantities to form a proposal."
+
+    st.subheader("Your Proposal")
+    st.write(proposal)
+
+    # Simple coherence checks
+    problems = []
+    if give_qty > current_alloc.loc[giver, give_good] + 1e-12:
+        problems.append(f"{giver} only has {current_alloc.loc[giver, give_good]:g} of {give_good} to give.")
+    if get_qty > current_alloc.loc[recipient, get_good] + 1e-12:
+        problems.append(f"{recipient} only has {current_alloc.loc[recipient, get_good]:g} of {get_good} to trade.")
+    if give_good == get_good and give_qty == get_qty and giver != recipient and give_qty > 0:
+        problems.append("Trading the same good for the same quantity is a wash.")
+
+    if problems:
+        st.warning(" ".join(problems))
+    else:
+        st.info("Looks coherent given current holdings (this does not execute the trade).")
+
+    st.divider()
+    st.caption("Tip: Share this page link with classmates. Append “?admin=1” to switch to the planner view (instructor only).")
