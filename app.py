@@ -6,6 +6,17 @@ import numpy as np
 from itertools import permutations
 from contextlib import closing
 
+# --- Admin gate (URL param) ---
+try:
+    params = st.experimental_get_query_params()  # works across Streamlit versions
+except Exception:
+    params = {}
+is_admin_mode = "admin" in params and str(params["admin"][0]).lower() in ["1", "true", "yes"]
+
+# Only show "Social Planner" when admin mode flag present
+role_options = ["Student"] + (["Social Planner"] if is_admin_mode else [])
+
+
 # --------- Config ---------
 GOODS = ["Gizmo", "Whatsit", "Thingamabob", "Doohickey", "Widget", "Contraption", "Gadget", "Whatchamacallit"]
 DB_PATH = "class_trade.db"
@@ -19,6 +30,26 @@ def get_conn():
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.execute("PRAGMA journal_mode=WAL;")
     return conn
+
+def reset_all_data():
+    # Wipe all rows from all tables (schema stays intact)
+    execute("DELETE FROM trades")
+    execute("DELETE FROM preferences")
+    execute("DELETE FROM endowments")
+    execute("DELETE FROM users")
+    # Optional: reclaim space
+    execute("VACUUM")
+
+def reset_group(grp):
+    # Optional: wipe just one group (keep others intact)
+    uids = [u[0] for u in get_group_users(grp)]
+    execute("DELETE FROM trades WHERE grp=?", (grp,))
+    for uid in uids:
+        execute("DELETE FROM preferences WHERE user_id=?", (uid,))
+        execute("DELETE FROM endowments WHERE user_id=?", (uid,))
+        execute("DELETE FROM users WHERE id=?", (uid,))
+    execute("VACUUM")
+
 
 def init_db():
     conn = get_conn()
@@ -283,7 +314,7 @@ st.session_state["refresh_interval"] = refresh_seconds
 
 with st.sidebar:
     st.header("Bilateral Trading Game")
-    role = st.radio("Select role", ["Student", "Social Planner"], index=0)
+    role = st.radio("Select role", role_options, index=0)
     grp = st.text_input("Group code", placeholder="e.g., A1 or econ101-1").strip()
     if role == "Student":
         name = st.text_input("Your name", placeholder="First Last").strip()
@@ -425,6 +456,30 @@ elif role == "Social Planner":
         st.dataframe(opt_df.sort_values("Name"), use_container_width=True, hide_index=True)
 
     st.caption("Notes: The maximum is computed over reassignments of the current item pool only. If SciPy is installed, the Hungarian algorithm is used; otherwise a fallback is used (exact up to 8 students, then greedy).")
+
+    st.divider()
+    st.subheader("Admin Controls")
+    
+    with st.expander("Danger Zone — Reset Data", expanded=False):
+        st.caption("Use with care. This cannot be undone.")
+    
+        c1, c2 = st.columns(2)
+    
+        with c1:
+            confirm_all = st.checkbox("I understand: Reset **ALL** groups", key="confirm_all_reset")
+            if st.button("⚠️ Reset ALL Data", type="primary", disabled=not confirm_all):
+                reset_all_data()
+                st.success("All data cleared. Fresh start!")
+                st.experimental_rerun()
+    
+        with c2:
+            st.caption("Optionally reset just this group.")
+            confirm_grp = st.checkbox("I understand: Reset **this** group only", key="confirm_grp_reset")
+            if st.button("♻️ Reset This Group (" + grp + ")", disabled=not confirm_grp):
+                reset_group(grp)
+                st.success("Group " + grp + " cleared.")
+                st.experimental_rerun()
+
 
 # ----- timed rerun -----
 if st.session_state.get("auto_refresh", False):
