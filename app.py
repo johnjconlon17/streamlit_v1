@@ -7,10 +7,7 @@ from itertools import permutations
 from contextlib import closing
 
 # --- Admin gate (URL param) ---
-try:
-    params = st.experimental_get_query_params()  # works across Streamlit versions
-except Exception:
-    params = {}
+params = st.query_params
 is_admin_mode = "admin" in params and str(params["admin"][0]).lower() in ["1", "true", "yes"]
 
 # Only show "Social Planner" when admin mode flag present
