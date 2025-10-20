@@ -270,8 +270,16 @@ def optimal_assignment(grp):
 
 # --------- UI ---------
 init_db()
-st_autorefresh = st.experimental_memo.clear if False else st.autorefresh
-st_autorefresh(interval=AUTOREFRESH_MS, key="autoreload")
+
+with st.sidebar:
+    st.header("Bilateral Trading Game")
+    # keep your existing role/group/name inputs here...
+    # add these two controls anywhere in the sidebar:
+    auto_refresh = st.toggle("Auto-refresh", value=True, help="Rerun the app on a timer so trades appear for everyone.")
+    refresh_seconds = st.number_input("Refresh every (seconds)", min_value=2, max_value=60, value=5, step=1)
+
+st.session_state["auto_refresh"] = auto_refresh
+st.session_state["refresh_interval"] = refresh_seconds
 
 with st.sidebar:
     st.header("Bilateral Trading Game")
@@ -418,3 +426,8 @@ elif role == "Social Planner":
 
     st.caption("Notes: The maximum is computed over reassignments of the current item pool only. If SciPy is installed, the Hungarian algorithm is used; otherwise a fallback is used (exact up to 8 students, then greedy).")
 
+# ----- timed rerun -----
+if st.session_state.get("auto_refresh", False):
+    import time
+    time.sleep(int(st.session_state.get("refresh_interval", 5)))
+    st.experimental_rerun()
