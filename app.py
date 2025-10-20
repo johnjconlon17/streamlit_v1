@@ -23,7 +23,11 @@ role_options = ["Student"] + (["Social Planner"] if is_admin_mode else [])
 # ─────────────────────────────────────────────
 # Config + auto-refresh defaults
 # ─────────────────────────────────────────────
-GOODS = ["Gizmo", "Whatsit", "Thingamabob", "Doohickey", "Widget", "Contraption", "Gadget", "Whatchamacallit"]
+GOODS = [
+    "Gizmo", "Whatsit", "Thingamabob", "Doohickey", "Widget",
+    "Contraption", "Gadget", "Whatchamacallit", "Doodad", "Thingy",
+    "Gubbins", "Apparatus", "Mechanism", "Rigamarole", "Oddment"
+]
 DB_PATH = "class_trade.db"
 
 if "auto_refresh" not in st.session_state:
@@ -117,21 +121,40 @@ def reset_group(grp):
 # ─────────────────────────────────────────────
 # Core model logic
 # ─────────────────────────────────────────────
+def get_group_users(grp):
+    return fetchall("SELECT id, name FROM users WHERE grp=? ORDER BY name", (grp,))
+
+def active_goods_in_group(grp):
+    rows = fetchall("""
+        SELECT e.good
+        FROM endowments e
+        JOIN users u ON u.id = e.user_id
+        WHERE u.grp=?
+    """, (grp,))
+    return sorted({r[0] for r in rows})
+
+def pick_start_good_unique(grp):
+    """Choose a starting good unique within the group if possible; otherwise allow repeats."""
+    used = set(active_goods_in_group(grp))
+    available = [g for g in GOODS if g not in used]
+    if available:
+        return random.choice(available)
+    return random.choice(GOODS)
+
 def get_or_create_user(name, grp):
     row = fetchone("SELECT id FROM users WHERE name=? AND grp=?", (name, grp))
     if row:
         return row[0]
     execute("INSERT INTO users (name, grp) VALUES (?,?)", (name, grp))
     uid = fetchone("SELECT id FROM users WHERE name=? AND grp=?", (name, grp))[0]
-    start_good = random.choice(GOODS)
+    # unique endowment if possible
+    start_good = pick_start_good_unique(grp)
     execute("INSERT INTO endowments VALUES (?,?)", (uid, start_good))
+    # full preference vector (we'll display only active goods later)
     for g in GOODS:
         u = random.randint(1, 10)
         execute("INSERT INTO preferences VALUES (?,?,?)", (uid, g, u))
     return uid
-
-def get_group_users(grp):
-    return fetchall("SELECT id, name FROM users WHERE grp=? ORDER BY name", (grp,))
 
 def get_user_endowment(uid):
     r = fetchone("SELECT good FROM endowments WHERE user_id=?", (uid,))
@@ -306,8 +329,12 @@ if role == "Student":
             good = get_user_endowment(uid)
             st.metric("You currently hold", good)
 
-            st.subheader("Your Preferences")
-            st.dataframe(get_user_prefs_df(uid), width='stretch', hide_index=True)
+            st.subheader("Your Preferences (active goods)")
+            prefs_df = get_user_prefs_df(uid)
+            active = active_goods_in_group(grp_clean)
+            if active:
+                prefs_df = prefs_df[prefs_df["Good"].isin(active)].sort_values("Good")
+            st.dataframe(prefs_df, width="stretch", hide_index=True)
 
             st.subheader("Propose a Trade")
             others = [(u[1], u[0]) for u in get_group_users(grp_clean) if u[0] != uid]
@@ -351,7 +378,7 @@ if role == "Student":
             st.subheader("Group Members")
             st.dataframe(
                 current_allocation_for_group(grp_clean)[["Name", "Good"]],
-                width='stretch',
+                width="stretch",
                 hide_index=True
             )
 
@@ -370,7 +397,7 @@ elif role == "Social Planner":
             st.title("Social Planner Dashboard")
 
             with st.expander("Current Allocation", expanded=True):
-                st.dataframe(df[["Name", "Good"]], width='stretch', hide_index=True)
+                st.dataframe(df[["Name", "Good"]], width="stretch", hide_index=True)
 
             cur = total_current_utility(grp)
             maxu, _, assign = optimal_assignment(grp)
@@ -388,12 +415,12 @@ elif role == "Social Planner":
             )
             st.subheader("Per-Student Utilities")
             st.dataframe(pd.DataFrame(rows, columns=["Name", "Good", "Utility"]),
-                         width='stretch', hide_index=True)
+                         width="stretch", hide_index=True)
 
             st.subheader("One Optimal Assignment")
             if assign:
                 st.dataframe(pd.DataFrame(assign, columns=["Name", "Assigned Good", "Utility"]),
-                             width='stretch', hide_index=True)
+                             width="stretch", hide_index=True)
             else:
                 st.caption("Not enough data yet.")
 
