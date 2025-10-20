@@ -1,5 +1,5 @@
 # app.py
-# Streamlit Allocation Planner with Admin/Participant Views
+# Streamlit Allocation Planner with Admin/Participant Views (URL-param only)
 # Requires: streamlit>=1.37, pandas>=2.0, numpy>=1.25, pulp, (optional) scipy
 # On Streamlit Cloud, include in requirements.txt:
 # streamlit>=1.37
@@ -18,14 +18,13 @@ st.set_page_config(page_title="Allocation Planner", layout="wide")
 
 
 # ------------------------------------------------------------
-# URL Param Role Detection
+# URL Param Role Detection (no UI toggles)
 # ------------------------------------------------------------
 def get_role_from_query() -> str:
     """
     Determine role from ?admin= URL param.
     Returns "planner" if admin in ("1","true","yes"), else "participant".
     """
-    # Streamlit >=1.26: st.query_params; older fallback: experimental_get_query_params
     try:
         admin_val = st.query_params.get("admin", "0")
     except Exception:
@@ -36,33 +35,9 @@ def get_role_from_query() -> str:
     return "planner" if is_admin else "participant"
 
 
-def set_role_in_url(is_admin: bool) -> None:
-    """
-    Update URL query param to flip views; supported on Cloud.
-    """
-    try:
-        st.query_params["admin"] = "1" if is_admin else "0"
-    except Exception:
-        # Older fallback
-        params = st.experimental_get_query_params()
-        params["admin"] = ["1" if is_admin else "0"]
-        st.experimental_set_query_params(**params)
-
-
 role = get_role_from_query()
-
-top_cols = st.columns([1, 1, 3])
-with top_cols[0]:
-    if st.button("Switch to Planner view"):
-        set_role_in_url(True)
-        st.rerun()
-with top_cols[1]:
-    if st.button("Switch to Participant view"):
-        set_role_in_url(False)
-        st.rerun()
-with top_cols[2]:
-    badge = "👑 Planner (admin=1)" if role == "planner" else "🧑‍🎓 Participant (admin=0)"
-    st.markdown(f"**View:** {badge}")
+st.markdown("**View:** {}"
+            .format("👑 Planner (admin=1)" if role == "planner" else "🧑‍🎓 Participant (admin=0)"))
 
 
 # ------------------------------------------------------------
@@ -79,7 +54,6 @@ def ensure_state():
     g = len(st.session_state.goods)
 
     if "utilities_df" not in st.session_state:
-        # Per-unit utility values (editable)
         vals = np.array([
             [8, 6, 2],
             [5, 7, 3],
@@ -151,23 +125,17 @@ def solve_pareto_improvement(
     people = list(utilities_df.index)
     goods = list(utilities_df.columns)
 
-    # Current utilities
     u_now = compute_utilities(utilities_df, current_alloc)
 
-    # LP
     prob = pulp.LpProblem("ParetoImprove", pulp.LpMaximize)
 
-    # Decision vars x[i,g] >= 0
     x_vars = {(i, g): pulp.LpVariable(f"x_{i}_{g}", lowBound=0) for i in people for g in goods}
 
-    # Objective
     prob += pulp.lpSum(utilities_df.loc[i, g] * x_vars[(i, g)] for i in people for g in goods)
 
-    # Goods availability
     for g in goods:
         prob += pulp.lpSum(x_vars[(i, g)] for i in people) <= float(stock[g])
 
-    # IR constraints: weak Pareto improvement
     for i in people:
         lhs = pulp.lpSum(utilities_df.loc[i, g] * x_vars[(i, g)] for g in goods)
         prob += lhs >= float(u_now[i])
@@ -175,7 +143,6 @@ def solve_pareto_improvement(
     status = prob.solve(pulp.PULP_CBC_CMD(msg=False))
     debug = {"status": pulp.LpStatus[status], "objective_value": pulp.value(prob.objective)}
 
-    # Build candidate allocation
     X = pd.DataFrame(0.0, index=people, columns=goods)
     for i in people:
         for g in goods:
@@ -257,7 +224,6 @@ def reindex_all_frames():
 ensure_state()
 reindex_all_frames()
 
-# Shared data references
 people = st.session_state.people
 goods = st.session_state.goods
 utilities_df = st.session_state.utilities_df.copy().astype(float)
@@ -266,7 +232,7 @@ current_alloc = st.session_state.allocation_df.copy().astype(float)
 
 
 # ============================================================
-# PLANNER (ADMIN) VIEW
+# PLANNER (ADMIN) VIEW  — visible only if ?admin=1/true/yes
 # ============================================================
 if role == "planner":
     st.title("Planner: Efficiency Dashboard & Controls")
@@ -286,7 +252,7 @@ if role == "planner":
                 reindex_all_frames()
                 st.rerun()
 
-    # Refresh references after potential edits
+    # Refresh after possible edits
     people = st.session_state.people
     goods = st.session_state.goods
     utilities_df = st.session_state.utilities_df.copy().astype(float)
@@ -306,13 +272,11 @@ if role == "planner":
     st.caption("Edit as needed. If totals exceed stock for any good, we scale down proportionally for feasibility checks.")
     st.dataframe(current_alloc, use_container_width=True, height=220)
 
-    # Soft clamp to stock (doesn't overwrite user input silently)
     clamped = clamp_allocation_to_stock(current_alloc, stock)
     if not clamped.equals(current_alloc):
         st.info("Current allocation exceeded stock for ≥1 good; using a scaled version for feasibility/efficiency checks below.")
     A_for_check = clamped
 
-    # Metrics
     u_now = compute_utilities(utilities_df, A_for_check)
     c1, c2, c3 = st.columns([1, 1, 1])
     with c1:
@@ -322,7 +286,6 @@ if role == "planner":
     with c3:
         st.metric("Max Individual Utility", f"{u_now.max():.3f}")
 
-    # Efficiency check via LP
     is_eff, proposed_alloc, deltas, debug = solve_pareto_improvement(
         utilities_df, stock, A_for_check, epsilon=1e-6
     )
@@ -361,12 +324,11 @@ if role == "planner":
 
 
 # ============================================================
-# PARTICIPANT (STUDENT) VIEW
+# PARTICIPANT (STUDENT) VIEW — default if admin not set
 # ============================================================
 else:
     st.title("Participant: Trade Proposals")
 
-    # Use current session data (read-only for participants, but visible)
     people = st.session_state.people
     goods = st.session_state.goods
     utilities_df = st.session_state.utilities_df.copy().astype(float)
@@ -406,7 +368,6 @@ else:
     st.subheader("Your Proposal")
     st.write(proposal)
 
-    # Simple coherence checks
     problems = []
     if give_qty > current_alloc.loc[giver, give_good] + 1e-12:
         problems.append(f"{giver} only has {current_alloc.loc[giver, give_good]:g} of {give_good} to give.")
@@ -421,4 +382,4 @@ else:
         st.info("Looks coherent given current holdings (this does not execute the trade).")
 
     st.divider()
-    st.caption("Tip: Share this page link with classmates. Append “?admin=1” to switch to the planner view (instructor only).")
+    st.caption("Tip: Instructors use the planner view by appending “?admin=1” to the app URL.")
