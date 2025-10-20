@@ -1,4 +1,4 @@
-# app.py — Multi-unit market with 1-for-1 / 2-for-1 / 1-for-2 / 2-for-2 trades
+# app.py — Multi-unit market with bundle trades (1x1, 2x1, 1x2, 2x2)
 import streamlit as st
 import sqlite3
 import random
@@ -7,6 +7,7 @@ import numpy as np
 from contextlib import closing
 import json
 import time
+import math
 
 # ─────────────────────────────────────────────
 # Page config FIRST
@@ -49,6 +50,16 @@ def get_conn():
     conn.execute("PRAGMA journal_mode=WAL;")
     conn.execute("PRAGMA busy_timeout=4000;")
     return conn
+
+def _safe_commit(conn, retries=2):
+    for i in range(retries + 1):
+        try:
+            conn.commit()
+            return
+        except Exception:
+            if i == retries:
+                raise
+            time.sleep(0.05 * (i + 1))
 
 def init_db():
     conn = get_conn()
@@ -100,29 +111,33 @@ def init_db():
                 grp TEXT NOT NULL,
                 proposer_id INTEGER NOT NULL,
                 recipient_id INTEGER NOT NULL,
-                offer_json TEXT NOT NULL,    -- {"type": count, ...} from proposer to recipient
-                request_json TEXT NOT NULL,  -- {"type": count, ...} from recipient to proposer
+                offer_json TEXT NOT NULL,    -- {"type": count, ...} proposer → recipient
+                request_json TEXT NOT NULL,  -- {"type": count, ...} recipient → proposer
                 status TEXT NOT NULL,        -- 'pending' | 'accepted' | 'declined' | 'cancelled'
                 ts DATETIME DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY(proposer_id) REFERENCES users(id),
                 FOREIGN KEY(recipient_id) REFERENCES users(id)
             )
         """)
-        conn.commit()
+        _safe_commit(conn)
 
 def fetchone(q, p=()):
-    c = get_conn(); cur = c.cursor()
-    cur.execute(q, p); r = cur.fetchone()
-    cur.close(); return r
+    c = get_conn()
+    with closing(c.cursor()) as cur:
+        cur.execute(q, p)
+        return cur.fetchone()
 
 def fetchall(q, p=()):
-    c = get_conn(); cur = c.cursor()
-    cur.execute(q, p); r = cur.fetchall()
-    cur.close(); return r
+    c = get_conn()
+    with closing(c.cursor()) as cur:
+        cur.execute(q, p)
+        return cur.fetchall()
 
 def execute(q, p=()):
-    c = get_conn(); cur = c.cursor()
-    cur.execute(q, p); c.commit(); cur.close()
+    c = get_conn()
+    with closing(c.cursor()) as cur:
+        cur.execute(q, p)
+        c.commit()
 
 # ─────────────────────────────────────────────
 # Group lifecycle helpers
@@ -155,7 +170,7 @@ def set_group_config(grp, status=None, k=None, t=None, types=None):
 def reset_group(grp):
     execute("DELETE FROM trades WHERE grp=?", (grp,))
     execute("DELETE FROM items  WHERE grp=?", (grp,))
-    # Keep users; they can re-join same names. Preferences remain; can be re-used.
+    # Keep users and preferences
     set_group_config(grp, status="waiting", types=[], k=1, t=5)
 
 def get_group_users(grp):
@@ -170,19 +185,17 @@ def get_or_create_user(name, grp):
     row = fetchone("SELECT id FROM users WHERE name=? AND grp=?", (name, grp))
     if row:
         return row[0]
-    # If market already started, block new joins
     if status == "started":
         raise RuntimeError("Market already started for this group; new students cannot join until reset.")
     execute("INSERT INTO users (name, grp) VALUES (?,?)", (name, grp))
     uid = fetchone("SELECT id FROM users WHERE name=? AND grp=?", (name, grp))[0]
-    # Create full preference vector across all master types (we'll display only active ones)
     for t in MASTER_GOODS:
         u = random.randint(1, 10)
         execute("INSERT OR REPLACE INTO preferences (user_id, type, utility) VALUES (?,?,?)", (uid, t, u))
     return uid
 
 def prefs_df_for_user(uid, active_types):
-    rows = fetchall("SELECT type, utility FROM preferences WHERE user_id=?",(uid,))
+    rows = fetchall("SELECT type, utility FROM preferences WHERE user_id=?", (uid,))
     df = pd.DataFrame(rows, columns=["Type", "Utility"])
     if active_types:
         df = df[df["Type"].isin(active_types)]
@@ -192,25 +205,24 @@ def prefs_df_for_user(uid, active_types):
 # Items / inventories
 # ─────────────────────────────────────────────
 def allocate_initial_items(grp, k, types):
-    # Remove any existing items first
     execute("DELETE FROM items WHERE grp=?", (grp,))
     users = get_group_users(grp)
-    if not users:
+    if not users or not types:
         return
     for uid, _ in users:
-        for _ in range(k):
+        for _ in range(int(k)):
             typ = random.choice(types)
             execute("INSERT INTO items (grp, type, owner_id) VALUES (?,?,?)", (grp, typ, uid))
 
 def inventory_counts(grp, uid):
     rows = fetchall("SELECT type, COUNT(*) FROM items WHERE grp=? AND owner_id=? GROUP BY type", (grp, uid))
-    return {t: c for (t, c) in rows}
+    return {t: int(c) for (t, c) in rows}
 
 def inventory_items_by_type(grp, uid):
     rows = fetchall("SELECT id, type FROM items WHERE grp=? AND owner_id=?", (grp, uid))
     by = {}
     for iid, t in rows:
-        by.setdefault(t, []).append(iid)
+        by.setdefault(t, []).append(int(iid))
     return by  # {type: [item_ids...]}
 
 def group_active_types(grp):
@@ -221,10 +233,9 @@ def group_active_types(grp):
 # Utility with zero marginal after first copy
 # ─────────────────────────────────────────────
 def bundle_utility(uid, types_set):
-    # types_set: set of type strings the user owns at least 1 of
     rows = fetchall("SELECT type, utility FROM preferences WHERE user_id=?", (uid,))
-    u_map = {t: v for (t, v) in rows}
-    return sum(u_map.get(t, 0) for t in types_set)
+    u_map = {t: int(v) for (t, v) in rows}
+    return int(sum(u_map.get(t, 0) for t in types_set))
 
 def user_types_set(grp, uid):
     rows = fetchall("SELECT DISTINCT type FROM items WHERE grp=? AND owner_id=?", (grp, uid))
@@ -232,17 +243,18 @@ def user_types_set(grp, uid):
 
 def current_total_utility(grp):
     users = get_group_users(grp)
-    s = 0
-    for uid, _ in users:
-        s += bundle_utility(uid, user_types_set(grp, uid))
-    return s
+    return sum(bundle_utility(uid, user_types_set(grp, uid)) for uid, _ in users)
 
 # ─────────────────────────────────────────────
 # Trade helpers (bundles up to 2 types per side)
 # ─────────────────────────────────────────────
 def valid_bundle(counts):
-    # counts: dict{type: int}
-    return all(isinstance(v, int) and v >= 0 for v in counts.values()) and sum(counts.values()) > 0
+    if not isinstance(counts, dict) or not counts:
+        return False
+    for v in counts.values():
+        if not isinstance(v, int) or v < 0:
+            return False
+    return sum(counts.values()) > 0
 
 def has_bundle(grp, uid, counts):
     if not counts:
@@ -254,8 +266,15 @@ def has_bundle(grp, uid, counts):
     return True
 
 def normalize_bundle(d):
-    # drop zeros and sort keys (stable text)
-    return {t: int(c) for t, c in sorted(d.items()) if int(c) > 0}
+    if not isinstance(d, dict):
+        return {}
+    out = {}
+    for k, v in d.items():
+        if k and isinstance(v, (int, float)):
+            n = int(v)
+            if n > 0:
+                out[k] = n
+    return out
 
 def propose_trade(grp, proposer_id, recipient_id, offer_counts, request_counts):
     offer = normalize_bundle(offer_counts)
@@ -268,7 +287,6 @@ def propose_trade(grp, proposer_id, recipient_id, offer_counts, request_counts):
         return "You no longer have the items you’re offering."
     if not has_bundle(grp, recipient_id, request):
         return "Partner no longer has the items you’re requesting."
-    # Record proposal
     execute("""INSERT INTO trades (grp, proposer_id, recipient_id, offer_json, request_json, status)
                VALUES (?,?,?,?,?, 'pending')""",
             (grp, proposer_id, recipient_id, json.dumps(offer), json.dumps(request)))
@@ -293,7 +311,6 @@ def decline_trade(trade_id):
     execute("UPDATE trades SET status='declined' WHERE id=?", (trade_id,))
 
 def accept_trade(grp, trade_id):
-    # Fetch and validate snapshot
     row = fetchone("""SELECT proposer_id, recipient_id, offer_json, request_json, status
                       FROM trades WHERE id=? AND grp=?""", (trade_id, grp))
     if not row:
@@ -301,27 +318,26 @@ def accept_trade(grp, trade_id):
     proposer_id, recipient_id, offer_js, request_js, status = row
     if status != "pending":
         return "Trade no longer pending."
-    offer = json.loads(offer_js)
-    request = json.loads(request_js)
-    # Validate current availability
+    offer = json.loads(offer_js); request = json.loads(request_js)
+
     if not has_bundle(grp, proposer_id, offer):
-        execute("UPDATE trades SET status='declined' WHERE id=?", (trade_id,))
+        decline_trade(trade_id)
         return "Offer invalid: proposer no longer has those items."
     if not has_bundle(grp, recipient_id, request):
-        execute("UPDATE trades SET status='declined' WHERE id=?", (trade_id,))
+        decline_trade(trade_id)
         return "Offer invalid: recipient no longer has requested items."
+
     # Move concrete item copies
-    # Get specific item ids by type for each side
     prop_items = inventory_items_by_type(grp, proposer_id)
     recp_items = inventory_items_by_type(grp, recipient_id)
 
-    # Transfer proposer→recipient (offer)
+    # proposer → recipient
     for t, c in offer.items():
         ids = prop_items.get(t, [])[:c]
         for iid in ids:
             execute("UPDATE items SET owner_id=? WHERE id=?", (recipient_id, iid))
 
-    # Transfer recipient→proposer (request)
+    # recipient → proposer
     for t, c in request.items():
         ids = recp_items.get(t, [])[:c]
         for iid in ids:
@@ -382,46 +398,46 @@ if role == "Student":
         with colA:
             st.subheader("Your Inventory")
             inv = inventory_counts(grp_clean, uid)
-            df = pd.DataFrame(
-                sorted([(t, inv.get(t, 0)) for t in (active_types or [])], key=lambda x: x[0]),
-                columns=["Type", "Count"]
-            )
-            st.dataframe(df, width="stretch", hide_index=True)
+            table_rows = [(t, inv.get(t, 0)) for t in (active_types or [])]
+            st.dataframe(pd.DataFrame(sorted(table_rows), columns=["Type", "Count"]),
+                         width="stretch", hide_index=True)
 
             st.subheader("Your Preferences (active types)")
             st.dataframe(prefs_df_for_user(uid, active_types), width="stretch", hide_index=True)
 
         with colB:
             st.subheader("Group Status")
-            st.write("Status: " + status.upper())
+            st.write("Status:", status.upper())
             roster = pd.DataFrame(get_group_users(grp_clean), columns=["user_id", "Name"])
             st.dataframe(roster[["Name"]], width="stretch", hide_index=True)
 
             if status == "waiting":
                 st.info("Waiting period — trades disabled until the planner starts the market.")
             else:
-                st.subheader("Propose a Trade (1-for-1, 2-for-1, 1-for-2, or 2-for-2)")
+                st.subheader("Propose a Trade (1-for-1, 2-for-1, 1-for-2, 2-for-2)")
                 others = [(u[1], u[0]) for u in get_group_users(grp_clean) if u[0] != uid]
                 if not others:
                     st.warning("No one else in your group yet.")
                 else:
-                    partner_name = st.selectbox("Choose partner", [o[0] for o in others])
-                    partner_id = dict(others)[partner_name]
+                    partner_names = [o[0] for o in others]
+                    partner = st.selectbox("Choose partner", partner_names, index=None, placeholder="Select a partner")
+                    partner_id = None if partner is None else dict(others)[partner]
+
                     inv_self = inventory_counts(grp_clean, uid)
-                    inv_partner = inventory_counts(grp_clean, partner_id)
+                    inv_partner = inventory_counts(grp_clean, partner_id) if partner_id else {}
 
                     # Offer side (you give)
                     st.markdown("**You offer**")
-                    offer_type1 = st.selectbox("Offer type 1", ["(none)"] + active_types, key="off1")
+                    offer_type1 = st.selectbox("Offer type 1", ["(none)"] + (active_types or []), index=0, key="off1")
                     offer_cnt1  = st.number_input("Count", 0, 2, 0, key="off1c")
-                    offer_type2 = st.selectbox("Offer type 2", ["(none)"] + active_types, key="off2")
+                    offer_type2 = st.selectbox("Offer type 2", ["(none)"] + (active_types or []), index=0, key="off2")
                     offer_cnt2  = st.number_input("Count ", 0, 2, 0, key="off2c")
 
                     # Request side (you receive)
                     st.markdown("**You request**")
-                    req_type1 = st.selectbox("Request type 1", ["(none)"] + active_types, key="req1")
+                    req_type1 = st.selectbox("Request type 1", ["(none)"] + (active_types or []), index=0, key="req1")
                     req_cnt1  = st.number_input("Count  ", 0, 2, 0, key="req1c")
-                    req_type2 = st.selectbox("Request type 2", ["(none)"] + active_types, key="req2")
+                    req_type2 = st.selectbox("Request type 2", ["(none)"] + (active_types or []), index=0, key="req2")
                     req_cnt2  = st.number_input("Count   ", 0, 2, 0, key="req2c")
 
                     offer = {}
@@ -431,17 +447,19 @@ if role == "Student":
                     if req_type1 != "(none)": request[req_type1] = req_cnt1
                     if req_type2 != "(none)": request[req_type2] = request.get(req_type2, 0) + req_cnt2
 
-                    # Show quick availability hints
-                    if offer:
-                        missing = [t for t, c in offer.items() if c > inv_self.get(t, 0)]
-                        if missing:
-                            st.warning("You don't have enough of: " + ", ".join(missing))
-                    if request:
-                        missing = [t for t, c in request.items() if c > inv_partner.get(t, 0)]
-                        if missing:
-                            st.warning(partner_name + " doesn't have enough of: " + ", ".join(missing))
+                    # Show quick availability hints (only if a partner is chosen)
+                    if partner_id is not None:
+                        if offer:
+                            missing = [t for t, c in offer.items() if c > inv_self.get(t, 0)]
+                            if missing:
+                                st.warning("You don't have enough of: " + ", ".join(missing))
+                        if request:
+                            missing = [t for t, c in request.items() if c > inv_partner.get(t, 0)]
+                            if missing:
+                                st.warning(partner + " doesn't have enough of: " + ", ".join(missing))
 
-                    if st.button("Send trade offer"):
+                    send_disabled = partner_id is None or not offer or not request
+                    if st.button("Send trade offer", disabled=send_disabled):
                         msg = propose_trade(grp_clean, uid, partner_id, offer, request)
                         if msg == "Trade proposed.":
                             st.success(msg)
@@ -456,11 +474,11 @@ if role == "Student":
                 else:
                     for tid, pid, offer_js, req_js, ts in inc:
                         prop_name = fetchone("SELECT name FROM users WHERE id=?", (pid,))[0]
-                        offer = json.loads(offer_js); req = json.loads(req_js)
+                        offer_d = json.loads(offer_js); req_d = json.loads(req_js)
                         with st.container(border=True):
-                            st.write("From: " + prop_name)
-                            st.write("They give you: " + json.dumps(req))
-                            st.write("You give them: " + json.dumps(offer))
+                            st.write("From:", prop_name)
+                            st.write("They give you:", req_d)
+                            st.write("You give them:", offer_d)
                             a, b = st.columns(2)
                             if a.button("Accept", key="acc" + str(tid)):
                                 res = accept_trade(grp_clean, tid)
@@ -480,9 +498,9 @@ if role == "Student":
                     for tid, rid, offer_js, req_js, ts in out:
                         rec_name = fetchone("SELECT name FROM users WHERE id=?", (rid,))[0]
                         with st.container(border=True):
-                            st.write("To: " + rec_name)
-                            st.write("You offer: " + offer_js)
-                            st.write("You request: " + req_js)
+                            st.write("To:", rec_name)
+                            st.write("You offer:", json.loads(offer_js))
+                            st.write("You request:", json.loads(req_js))
                             if st.button("Cancel", key="can" + str(tid)):
                                 cancel_trade(grp_clean, uid, tid); st.rerun()
 
@@ -497,7 +515,7 @@ elif role == "Social Planner":
         status, k_cfg, t_cfg, active_types = get_group_state(grp)
 
         st.title("Social Planner")
-        st.markdown("**Group:** " + grp + " · **Status:** " + status.upper())
+        st.write("Group:", grp, "· Status:", status.upper())
 
         with st.expander("Roster"):
             roster = pd.DataFrame(get_group_users(grp), columns=["user_id", "Name"])
@@ -505,8 +523,10 @@ elif role == "Social Planner":
 
         st.subheader("Configuration")
         k_new = st.number_input("Units per student (K)", 1, 10, k_cfg)
-        t_new = st.number_input("Number of distinct types (T)", 2, min(12, len(MASTER_GOODS)), min(t_cfg, len(MASTER_GOODS)))
-        st.caption("Types are sampled from a master list; duplicates in inventories are allowed.")
+        max_t = min(len(MASTER_GOODS), 15)
+        t_new = st.number_input("Number of distinct types (T)", 2, max_t, min(t_cfg, max_t))
+        st.caption("T types are sampled from a master list; duplicates in inventories are allowed.")
+
         if st.button("Save config (does not start market)"):
             set_group_config(grp, k=int(k_new), t=int(t_new))
             st.success("Config saved.")
@@ -514,7 +534,6 @@ elif role == "Social Planner":
         st.subheader("Start / Reset")
         if status == "waiting":
             if st.button("Start Market"):
-                # Pick T types, allocate K per student
                 types = random.sample(MASTER_GOODS, int(t_new))
                 set_group_config(grp, status="started", k=int(k_new), t=int(t_new), types=types)
                 allocate_initial_items(grp, int(k_new), types)
@@ -529,18 +548,18 @@ elif role == "Social Planner":
 
         st.subheader("Active Types & Totals")
         status, k_cfg, t_cfg, active_types = get_group_state(grp)
-        st.write("Active types: " + (", ".join(active_types) if active_types else "(none)"))
+        st.write("Active types:", ", ".join(active_types) if active_types else "(none)")
 
         if status == "started":
             users = get_group_users(grp)
-            # Inventory table
             rows = []
             for uid, nm in users:
                 counts = inventory_counts(grp, uid)
+                types_set = {t for t in active_types if counts.get(t, 0) > 0}
                 rows.append(
                     {"Name": nm, **{t: counts.get(t, 0) for t in active_types},
-                     "Distinct types": sum(1 for t in active_types if counts.get(t, 0) > 0),
-                     "Utility": bundle_utility(uid, {t for t in active_types if counts.get(t, 0) > 0})}
+                     "Distinct types": len(types_set),
+                     "Utility": bundle_utility(uid, types_set)}
                 )
             st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
             st.metric("Total utility (set utility)", current_total_utility(grp))
